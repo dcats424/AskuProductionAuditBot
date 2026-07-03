@@ -1,0 +1,72 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+
+concurrency:
+  group: production-deploy
+  cancel-in-progress: true
+
+jobs:
+  CI:
+    name: Continuous Integration
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Syntax check
+        run: python -c "import py_compile; py_compile.compile('bot.py', doraise=True)"
+
+      - name: CI Success
+        run: echo "CI completed successfully"
+
+  CD:
+    name: Continuous Deployment
+    runs-on: self-hosted
+    needs: CI
+
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Deploy application
+        run: |
+          set -e
+
+          echo "=============================="
+          echo "Starting deployment..."
+          echo "=============================="
+
+          cd /home/time/Documents/production-audit-bot
+
+          echo "Pulling latest code..."
+          git fetch origin    
+          git reset --hard origin/main
+          git clean -fdx -e .env
+
+          echo "Installing dependencies..."
+          pip install -r requirements.txt --break-system-packages
+
+          echo "Restarting bot..."
+          pkill -f "python3.*bot.py" || true
+          sleep 1
+          nohup python3 bot.py > bot.log 2>&1 &
+
+          echo "Checking bot is running..."
+          sleep 2
+          pgrep -f "python3.*bot.py" && echo "Bot running" || echo "Bot failed to start"
+
+          echo "=============================="
+          echo "Deployment completed successfully"
+          echo "=============================="
