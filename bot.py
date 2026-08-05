@@ -187,6 +187,30 @@ AUDIT STATUS:
 - CLOSED / FOLLOW-UP REQUIRED
 """
 
+WEEKLY_REPORT_SYSTEM_PROMPT = """
+You are a plant-level executive production analyst writing a professional weekly summary for a beverage bottling plant.
+
+Write a well-structured executive summary for the full production week of the data provided:
+- Overall operational performance against the weekly plan
+- Downtime: state which category (MECHANICAL / ELECTRICAL / UTILITY) dominated the week
+  and what it implies for the plant
+- Aggregate quality performance and reject patterns
+- Clear conclusions about weekly stability
+
+FORMATTING RULES (strict):
+- Output 3–4 separate paragraphs. Do NOT merge into one block.
+- Each paragraph: 2–3 sentences. One idea per paragraph.
+- One blank line between paragraphs.
+
+WRITING STYLE:
+- Proper grammar, capitalization, punctuation.
+- Every sentence starts with a capital letter.
+- Numeric format for all numbers (50.7%, 15 min, 710 packs).
+- Do NOT convert numbers to words.
+- Analytical, concise, executive-level.
+- Base conclusions strictly on the structured data provided.
+"""
+
 # Legacy schedule dict (no longer used for shift boundaries).
 # We keep it to avoid breaking older references, but all scheduling is now derived from
 # Ethiopian clock times converted to PC time via ethiopian_clock_time_to_pc_time().
@@ -1024,17 +1048,43 @@ def detect_repeated_faults(downtime, operator_notes):
 
 
 # ---------------- KPI CALCULATION ENGINE ----------------
+def get_pcs_per_pack(product_type: str | None) -> int:
+    """
+    Convert pack size to pcs per pack based on product type.
+    - 1Ltr / 2Ltr     -> 6 pcs per pack
+    - 0.6Ltr / 0.3Ltr -> 12 pcs per pack
+    - Unknown product -> default 6 pcs per pack
+    """
+    if not product_type:
+        return 6
+    match = re.search(r"(\d+(?:\.\d+)?)", str(product_type).lower())
+    if not match:
+        return 6
+    volume = float(match.group(1))
+    if volume in (0.6, 0.3):
+        return 12
+    if volume in (1, 2):
+        return 6
+    return 6
+
+
 def compute_kpis(
     plan: int,
     actual: int,
     downtime_minutes: int,
     production_hours: float,
     rejects: dict,
+    output_pcs: int | None = None,
 ) -> dict:
     """
     Deterministic KPI calculation engine.
     Returns standardized KPI metrics for all report types.
+    output_pcs: actual output converted from packs to pcs (pack size × pcs per pack).
+    Only used for reject% and quality% where rejects are in pcs.
     """
+    if output_pcs is None:
+        output_pcs = actual
+
     # 1️⃣ Performance % - (Actual Production / Planned Production) * 100
     performance = round((actual / plan) * 100, 1) if plan > 0 else 0.0
 
@@ -1046,24 +1096,24 @@ def compute_kpis(
         else 0.0
     )
 
-    # 3️⃣ Quality %
+    # 3️⃣ Quality % - output (pcs) / (reject qty (pcs) + output (pcs)) * 100
     defective_qty = rejects.get("preform", 0) + rejects.get("bottle", 0)
     quality = (
-        round((actual / (actual + defective_qty)) * 100, 1)
-        if (actual + defective_qty) > 0
+        round((output_pcs / (output_pcs + defective_qty)) * 100, 1)
+        if (output_pcs + defective_qty) > 0
         else 0.0
     )
 
     # 4️⃣ OEE
     oee = round((performance * availability * quality) / 10000, 2)
 
-    # 5️⃣ Reject Percentages
+    # 5️⃣ Reject Percentages - reject qty (pcs) / (reject qty (pcs) + output (pcs)) * 100
     reject_percentages = {}
     for category in ["preform", "bottle", "cap", "label", "shrink"]:
         reject_qty = rejects.get(category, 0)
         reject_pct = (
-            round((reject_qty / (reject_qty + actual)) * 100, 1)
-            if (reject_qty + actual) > 0
+            round((reject_qty / (reject_qty + output_pcs)) * 100, 1)
+            if (reject_qty + output_pcs) > 0
             else 0.0
         )
         reject_percentages[category] = reject_pct
@@ -1181,9 +1231,13 @@ async def send_or_queue_reminder(
     context: ContextTypes.DEFAULT_TYPE,
     text: str,
     parse_mode: str | None = "Markdown",
+    meta: dict | None = None,
 ) -> str:
     """
     Central dispatch for all scheduled reminders.
+
+    meta: optional dict with reminder frame info for tracking/deletion:
+          {"kind": "hourly_plan"|"hourly_summary", "shift": int, "hour": int}
 
     Suppression rules (line OFF / sanitation ON):
     ─────────────────────────────────────────────
@@ -1298,6 +1352,7 @@ async def send_or_queue_reminder(
                 "shift": shift_now,
                 "date": date_now,
                 "mute_type": "ai",
+                "meta": meta,
             }
         )
         logger.info(
@@ -1310,15 +1365,61 @@ async def send_or_queue_reminder(
         f"Sending reminder to group: Shift {shift_now} at {now.strftime('%H:%M:%S')}"
     )
     try:
-        await context.bot.send_message(
+        sent = await context.bot.send_message(
             chat_id=GROUP_CHAT_ID,
             text=text,
             parse_mode=parse_mode,
         )
+        if meta:
+            _record_reminder_message(meta, sent.message_id)
         return "sent"
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
         return "failed"
+
+
+def _reminder_msg_key(kind: str, shift: int, hour: int) -> str:
+    """bot_state key storing the message_id of a sent hourly reminder."""
+    return f"reminder_msg_{kind}_{shift}_{hour}"
+
+
+def _record_reminder_message(meta: dict, message_id: int) -> None:
+    """Store the Telegram message_id of a sent hourly reminder for later deletion."""
+    kind = meta.get("kind")
+    shift = meta.get("shift")
+    hour = meta.get("hour")
+    if not kind or not shift or not hour:
+        return
+    bot_state_set(_reminder_msg_key(kind, shift, hour), str(message_id))
+    logger.info(f"Tracked reminder message: {kind} shift={shift} hour={hour} id={message_id}")
+
+
+def _previous_frame(shift: int, hour: int) -> tuple:
+    """Frame (shift, hour) before the given one; wraps shift boundary (hour 1 ← prev shift hour 12)."""
+    if hour > 1:
+        return shift, hour - 1
+    prev_shift = 2 if shift == 1 else 1
+    return prev_shift, 12
+
+
+async def delete_reminder_frame(bot, shift: int, hour: int) -> None:
+    """
+    Delete the hourly plan + summary reminder messages of a given (shift, hour) frame.
+    Failures (already deleted, too old, network) are logged and ignored — never crashes.
+    """
+    for kind in ("hourly_plan", "hourly_summary"):
+        key = _reminder_msg_key(kind, shift, hour)
+        msg_id_str = bot_state_get(key)
+        if not msg_id_str:
+            continue
+        try:
+            await bot.delete_message(chat_id=GROUP_CHAT_ID, message_id=int(msg_id_str))
+            logger.info(f"Deleted old {kind} reminder shift={shift} hour={hour} (id={msg_id_str})")
+        except Exception as e:
+            logger.warning(
+                f"Could not delete {kind} reminder shift={shift} hour={hour} (id={msg_id_str}): {e}"
+            )
+        bot_state_set(key, "")
 
 
 async def flush_pending_reminders(bot, reason: str | None = None) -> None:
@@ -1326,25 +1427,39 @@ async def flush_pending_reminders(bot, reason: str | None = None) -> None:
     Flush queued reminders.
     - reason="ai":   send ALL AI-muted reminders regardless of time/shift
     - reason="line": send AI-muted reminders only; drop all line-muted items (no backlog)
+    Expired hourly plan/summary items (frame already passed) are dropped, never sent.
     """
     global pending_reminders
 
     if not pending_reminders:
         return
 
+    now = now_ethiopia()
+    current_shift_num = get_shift_for_time(now)
+    current_hour_num = get_current_hour_number(current_shift_num, now)
+
     to_send = []
     remaining = []
 
-    if reason == "ai":
-        for item in pending_reminders:
+    for item in pending_reminders:
+        meta = item.get("meta")
+        if meta and meta.get("kind") in ("hourly_plan", "hourly_summary"):
+            item_shift = meta.get("shift")
+            item_hour = meta.get("hour")
+            frame_passed = (item_shift, item_hour) < (current_shift_num, current_hour_num)
+            if frame_passed:
+                logger.info(
+                    f"Expired queued reminder dropped: {meta.get('kind')} "
+                    f"shift={item_shift} hour={item_hour} "
+                    f"(now shift={current_shift_num} hour={current_hour_num})"
+                )
+                continue
+        if reason == "ai":
             if item.get("mute_type") == "ai":
                 to_send.append(item)
             else:
                 remaining.append(item)
-    else:
-        # reason="line" or default:
-        # Send AI-muted items, drop ALL line-muted items (no backlog for planning reminders)
-        for item in pending_reminders:
+        else:
             if item.get("mute_type") == "ai":
                 to_send.append(item)
             # line-muted items are intentionally dropped here — no else/remaining
@@ -1374,11 +1489,19 @@ async def flush_pending_reminders(bot, reason: str | None = None) -> None:
 
     for item in to_send:
         try:
-            await bot.send_message(
+            sent = await bot.send_message(
                 chat_id=GROUP_CHAT_ID,
                 text=item["text"],
                 parse_mode=item.get("parse_mode"),
             )
+            meta = item.get("meta")
+            if meta:
+                _record_reminder_message(meta, sent.message_id)
+                if meta.get("kind") == "hourly_plan":
+                    prev_shift, prev_hour = _previous_frame(
+                        meta["shift"], meta["hour"]
+                    )
+                    await delete_reminder_frame(bot, prev_shift, prev_hour)
             await asyncio.sleep(0.5)
         except Exception as e:
             logger.error(f"flush_pending_reminders: failed to send item: {e}")
@@ -1533,11 +1656,21 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
                 + "- Expected challenges"
             )
             try:
-                await app.bot.send_message(
+                sent = await app.bot.send_message(
                     chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown"
                 )
                 bot_state_set(sched_key, "1")
                 bot_state_set(catch_key, "1")
+                _record_reminder_message(
+                    {
+                        "kind": "hourly_plan",
+                        "shift": current_shift_num,
+                        "hour": current_hour_num,
+                    },
+                    sent.message_id,
+                )
+                prev_shift, prev_hour = _previous_frame(current_shift_num, current_hour_num)
+                await delete_reminder_frame(app.bot, prev_shift, prev_hour)
                 sent_count += 1
                 await asyncio.sleep(1)
                 logger.info(
@@ -1575,11 +1708,19 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
                     + "💡 AI will generate an hourly summary after you submit the data."
                 )
                 try:
-                    await app.bot.send_message(
+                    sent = await app.bot.send_message(
                         chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown"
                     )
                     bot_state_set(sched_key, "1")
                     bot_state_set(catch_key, "1")
+                    _record_reminder_message(
+                        {
+                            "kind": "hourly_summary",
+                            "shift": current_shift_num,
+                            "hour": current_hour_num,
+                        },
+                        sent.message_id,
+                    )
                     sent_count += 1
                     await asyncio.sleep(1)
                     logger.info(
@@ -2377,6 +2518,343 @@ async def generate_multi_shift_summary_and_post(
     )
 
 
+# ---------------- WEEKLY REPORT ----------------
+def aggregate_week_from_db(start_date, end_date) -> dict | None:
+    """
+    Aggregate production, downtime, rejects, and VOS over a date range (inclusive)
+    from the hourly_production tables (hourly rows summed over the week).
+    Returns a dict of weekly totals (per-hour pcs conversion applied),
+    or None if no data exists in the range.
+    """
+    _ensure_hourly_production_table()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            """
+            SELECT id, shift, hour, product_type, plan_pack,
+                   actual_output_pack, available_time, vos_info
+            FROM hourly_production
+            WHERE date BETWEEN %s AND %s
+            ORDER BY date, shift, hour
+            """,
+            (start_date, end_date),
+        )
+        rows = cur.fetchall()
+
+        if not rows:
+            return None
+
+        totals = {
+            "plan": 0,
+            "actual": 0,
+            "available_minutes": 0,
+            "output_pcs": 0,
+            "vos_minutes": 0,
+            "downtime": 0,
+            "cat_totals": {"MECHANICAL": 0, "ELECTRICAL": 0, "UTILITY": 0},
+            "rejects": {"preform": 0, "bottle": 0, "cap": 0, "label": 0, "shrink": 0.0},
+            "products": set(),
+            "shift_count": 0,
+        }
+
+        for row in rows:
+            (h_id, shift, hour_num, product_type, plan, actual, available_time, vos_info) = row
+
+            available = available_time if available_time is not None else 60
+            totals["plan"] += plan or 0
+            totals["actual"] += actual or 0
+            totals["available_minutes"] += available
+            totals["output_pcs"] += (actual or 0) * get_pcs_per_pack(product_type)
+            totals["vos_minutes"] += parse_vos_minutes(vos_info)
+            totals["shift_count"] += 1
+            if product_type:
+                totals["products"].add(str(product_type).strip())
+
+            cur.execute(
+                """
+                SELECT duration_min, category FROM hourly_downtime_events
+                WHERE hourly_production_id = %s
+                """,
+                (h_id,),
+            )
+            for dur, cat in cur.fetchall():
+                dur = dur or 0
+                totals["downtime"] += dur
+                cat_upper = (cat or "MECHANICAL").upper().strip()
+                if cat_upper not in totals["cat_totals"]:
+                    cat_upper = "MECHANICAL"
+                totals["cat_totals"][cat_upper] += dur
+
+            cur.execute(
+                """
+                SELECT preform, bottle, cap, label, shrink FROM hourly_rejects
+                WHERE hourly_production_id = %s
+                """,
+                (h_id,),
+            )
+            rej = cur.fetchone()
+            if rej:
+                for cat, val in zip(
+                    ("preform", "bottle", "cap", "label", "shrink"), rej
+                ):
+                    totals["rejects"][cat] = round(
+                        totals["rejects"][cat] + (val or 0), 2
+                    )
+
+        return totals
+    except Exception as e:
+        logger.error(f"aggregate_week_from_db failed: {e}")
+        return None
+    finally:
+        cur.close()
+        conn.close()
+
+
+def format_vos_duration(total_minutes: int) -> str:
+    """Format VOS minutes as hours/minutes, e.g. 195 -> '3 hr 15 min'."""
+    if total_minutes < 60:
+        return f"{total_minutes} min"
+    hours = total_minutes // 60
+    minutes = total_minutes % 60
+    if minutes:
+        return f"{hours} hr {minutes} min"
+    return f"{hours} hr"
+
+
+async def weekly_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    /weekly_report [DD/MM/YY]
+    Generate a weekly production summary for the calendar week (Mon-Sun) of the
+    given date. Defaults to the current week.
+    """
+    target_date = None
+    if context.args:
+        raw = context.args[0].strip()
+        for fmt in ("%d/%m/%y", "%d/%m/%Y", "%Y-%m-%d"):
+            try:
+                target_date = datetime.strptime(raw, fmt).date()
+                break
+            except ValueError:
+                continue
+        if target_date is None:
+            await update.message.reply_text("Invalid date. Use DD/MM/YY, e.g. 15/07/26")
+            return
+
+    if target_date is None:
+        target_date = get_latest_hourly_date_for_all_shifts()
+        if target_date is None:
+            await update.message.reply_text(
+                "⚠️ No hourly data found in database. Submit some reports first."
+            )
+            return
+
+    week_start = target_date - timedelta(days=target_date.weekday())  # Monday
+    week_end = week_start + timedelta(days=6)  # Sunday
+
+    start_label = week_start.strftime("%d/%m/%Y")
+    end_label = week_end.strftime("%d/%m/%Y")
+
+    totals = aggregate_week_from_db(week_start, week_end)
+    if not totals:
+        await update.message.reply_text(
+            f"⚠️ No production data found for week {start_label} – {end_label}.\n"
+            "Submit shift reports first."
+        )
+        return
+
+    # ── KPI calculations (same formulas as compute_kpis, weekly scale) ──────
+    total_plan = totals["plan"]
+    total_actual = totals["actual"]
+    output_pcs = totals["output_pcs"]
+    available_minutes = totals["available_minutes"]
+    total_downtime = totals["downtime"]
+    rejects = totals["rejects"]
+
+    performance = round((total_actual / total_plan) * 100, 1) if total_plan else 0.0
+    production_hours = available_minutes / 60
+    downtime_hours = total_downtime / 60
+    availability = (
+        round(((production_hours - downtime_hours) / production_hours) * 100, 1)
+        if production_hours > 0
+        else 0.0
+    )
+    defective_qty = rejects.get("preform", 0) + rejects.get("bottle", 0)
+    quality = (
+        round((output_pcs / (output_pcs + defective_qty)) * 100, 1)
+        if (output_pcs + defective_qty) > 0
+        else 0.0
+    )
+    oee = round((performance * availability * quality) / 10000, 2)
+    downtime_ratio = (
+        round((total_downtime / available_minutes) * 100, 2)
+        if available_minutes
+        else 0
+    )
+
+    reject_percentages = {}
+    for category in ["preform", "bottle", "cap", "label", "shrink"]:
+        reject_qty = rejects.get(category, 0)
+        reject_percentages[category] = (
+            round((reject_qty / (reject_qty + output_pcs)) * 100, 1)
+            if (reject_qty + output_pcs) > 0
+            else 0.0
+        )
+
+    dt_totals = totals["cat_totals"]
+    dominant_cat = max(dt_totals, key=dt_totals.get) if any(dt_totals.values()) else "N/A"
+
+    # ── Risk score (mirrors shift-summary logic) ────────────────────────────
+    risk_score = 0
+    if performance < 60:
+        risk_score += 3
+    elif performance < 75:
+        risk_score += 2
+    if downtime_ratio > 40:
+        risk_score += 3
+    elif downtime_ratio > 25:
+        risk_score += 2
+    total_rejects_count = (
+        rejects.get("bottle", 0) + rejects.get("cap", 0) + rejects.get("label", 0)
+    )
+    if output_pcs > 0:
+        rr = (total_rejects_count / output_pcs) * 100
+        if rr > 5:
+            risk_score += 2
+        elif rr > 2:
+            risk_score += 1
+    risk_level = (
+        "CRITICAL" if risk_score >= 7 else "HIGH" if risk_score >= 5 else "MODERATE" if risk_score >= 3 else "LOW"
+    )
+    audit_status = "CLOSED" if risk_level in ("LOW", "MODERATE") else "FOLLOW-UP REQUIRED"
+
+    # ── AI executive narrative ──────────────────────────────────────────────
+    product_str = ", ".join(sorted(totals["products"])) if totals["products"] else "N/A"
+    structured_data = f"""
+WEEK: {start_label} to {end_label}
+SHIFT_COUNT: {totals['shift_count']}
+PRODUCT(S): {product_str}
+TOTAL_PLAN: {total_plan}
+TOTAL_ACTUAL: {total_actual}
+TOTAL_AVAILABLE_TIME: {available_minutes} minutes
+TOTAL_VOS: {totals['vos_minutes']} minutes
+PERFORMANCE: {performance}%
+AVAILABILITY: {availability}%
+QUALITY: {quality}%
+OEE: {oee}%
+TOTAL_DOWNTIME: {total_downtime} minutes
+DOWNTIME_RATIO: {downtime_ratio}%
+DOWNTIME BY CATEGORY:
+  MECHANICAL: {dt_totals.get('MECHANICAL', 0)} min
+  ELECTRICAL: {dt_totals.get('ELECTRICAL', 0)} min
+  UTILITY:    {dt_totals.get('UTILITY', 0)} min
+  DOMINANT:   {dominant_cat}
+REJECTS_BREAKDOWN:
+- Preform: {rejects.get('preform', 0)}
+- Bottle:  {rejects.get('bottle', 0)}
+- Cap:     {rejects.get('cap', 0)}
+- Label:   {rejects.get('label', 0)}
+- Shrink:  {rejects.get('shrink', 0)} kg
+DEFECTIVE_QUANTITY: {defective_qty}
+RISK_LEVEL: {risk_level}
+AUDIT_STATUS: {audit_status}
+"""
+
+    loop = asyncio.get_running_loop()
+
+    def call_ai():
+        return ai_client.chat.completions.create(
+            model=AI_MODEL,
+            messages=[
+                {
+                    "role": "system",
+                    "content": WEEKLY_REPORT_SYSTEM_PROMPT,
+                },
+                {"role": "user", "content": structured_data},
+            ],
+            temperature=0.2,
+        )
+
+    executive_paragraph = "Weekly performance summary unavailable."
+    try:
+        response = await loop.run_in_executor(None, call_ai)
+        executive_paragraph = response.choices[0].message.content.strip()
+    except Exception as e:
+        logger.error(f"Weekly AI narrative failed: {e}")
+
+    # ── Report sections (same format as shift report, weekly totals) ────────
+    vos_display = format_vos_duration(totals["vos_minutes"])
+    production_performance = (
+        f"📊 PRODUCTION PERFORMANCE\n\n"
+        f"  • Product: {product_str}\n"
+        f"  • Plan: {total_plan:,} packs\n"
+        f"  • Actual: {total_actual:,} packs\n"
+        f"  • Available Time: {available_minutes:,} minutes\n"
+        f"  • Efficiency: {performance}%\n"
+        f"  • VOS: {vos_display} (week total)"
+    )
+
+    downtime_hours_display = round(total_downtime / 60, 1)
+    available_hours_display = round(available_minutes / 60, 1)
+    downtime_analysis = (
+        f"⏱️ DOWNTIME ANALYSIS\n\n"
+        f"  • Total Downtime:     {total_downtime} minutes\n"
+        f"  • Downtime Ratio:     {downtime_ratio}%({downtime_hours_display}hr) of {available_hours_display}hr(available time)\n"
+        f"  • Dominant Category:  {dominant_cat} ({dt_totals.get(dominant_cat, 0)} min)\n"
+        f"  • Mechanical:         {dt_totals.get('MECHANICAL', 0)} min\n"
+        f"  • Electrical:         {dt_totals.get('ELECTRICAL', 0)} min\n"
+        f"  • Utility:            {dt_totals.get('UTILITY', 0)} min"
+    )
+
+    reject_table = f"""
+🗑 QUALITY – REJECT ANALYSIS
+-------------------------
+
+{"Item":<20} {"Reject %":<15} {"Reject Qty":<12}
+{"-" * 47}
+Preform              {reject_percentages["preform"]:.1f} %           {rejects.get("preform", 0)} pcs
+Bottle               {reject_percentages["bottle"]:.1f} %          {rejects.get("bottle", 0)} pcs
+Cap                  {reject_percentages["cap"]:.1f} %          {rejects.get("cap", 0)} pcs
+Label                {reject_percentages["label"]:.1f} %          {rejects.get("label", 0)} pcs
+Shrink               {reject_percentages["shrink"]:.1f} %           {rejects.get("shrink", 0)} kg
+"""
+
+    oee_performance = (
+        f"📈 OVERALL EQUIPMENT EFFECTIVENESS\n\n"
+        f"  • Plan: {total_plan:,} pcs\n"
+        f"  • Actual: {total_actual:,} pcs\n"
+        f"  • Defective Quantity: {defective_qty:,} pcs\n"
+        f"  • Production Time: {production_hours:.2f} hr ({available_minutes} min)\n"
+        f"  • Downtime: {downtime_hours:.2f} hr ({total_downtime} min)\n"
+        f"  • Availability: {availability:.1f}%\n"
+        f"  • Performance: {performance:.1f}%\n"
+        f"  • Quality: {quality:.1f}%\n"
+        f"  • OEE: {oee:.2f}%"
+    )
+
+    final_report = (
+        f"📊 WEEKLY PRODUCTION SUMMARY ({start_label} – {end_label})\n\n"
+        f"✅ STATUS: COMPLETE\n\n"
+        f"⚠️ RISK LEVEL: {risk_level}\n\n"
+        f"📋 EXECUTIVE SUMMARY\n\n"
+        f"{executive_paragraph}\n\n"
+        f"────────────────────────────\n\n"
+        f"{production_performance}"
+        f"\n\n────────────────────────────\n\n"
+        f"{downtime_analysis}"
+        f"\n\n────────────────────────────\n\n"
+        f"{reject_table}"
+        f"\n\n────────────────────────────\n\n"
+        f"{oee_performance}"
+        f"\n\n────────────────────────────\n\n"
+        f"📌 AUDIT STATUS: {audit_status}"
+    )
+
+    await split_and_send_long_message(
+        context.bot, GROUP_CHAT_ID, final_report.strip(), parse_mode=None
+    )
+
+
 DOWNTIME_CATEGORIES = {
     "MECHANICAL": ["mechanical", "machine", "technical"],
     "ELECTRICAL": ["electrical", "electric"],
@@ -2572,8 +3050,9 @@ async def ai_generate_summary(shift: int):
     )
 
     # ── KPI (unchanged) ──────────────────────────────────────────────────────
+    output_pcs = actual_output * get_pcs_per_pack(production_data["product_type"])
     kpis = compute_kpis(
-        plan_output, actual_output, total_downtime, production_hours, rejects
+        plan_output, actual_output, total_downtime, production_hours, rejects, output_pcs
     )
     downtime_ratio = (
         round((total_downtime / available_time_minutes) * 100, 2)
@@ -2594,8 +3073,8 @@ async def ai_generate_summary(shift: int):
     total_rejects_count = (
         rejects.get("bottle", 0) + rejects.get("cap", 0) + rejects.get("label", 0)
     )
-    if actual_output > 0:
-        rr = (total_rejects_count / actual_output) * 100
+    if output_pcs > 0:
+        rr = (total_rejects_count / output_pcs) * 100
         if rr > 5:
             risk_score += 2
         elif rr > 2:
@@ -2812,8 +3291,9 @@ async def ai_generate_hourly_summary_from_text(report_text: str):
     available_time_minutes = max(available_time_minutes, 0)
     production_hours = available_time_minutes / 60
 
+    output_pcs = actual_output * get_pcs_per_pack(production_data["product_type"])
     kpis = compute_kpis(
-        plan_output, actual_output, total_downtime, production_hours, rejects
+        plan_output, actual_output, total_downtime, production_hours, rejects, output_pcs
     )
     downtime_ratio = (
         round((total_downtime / available_time_minutes) * 100, 2)
@@ -2834,8 +3314,8 @@ async def ai_generate_hourly_summary_from_text(report_text: str):
     total_rejects_count = (
         rejects.get("bottle", 0) + rejects.get("cap", 0) + rejects.get("label", 0)
     )
-    if actual_output > 0:
-        rr = (total_rejects_count / actual_output) * 100
+    if output_pcs > 0:
+        rr = (total_rejects_count / output_pcs) * 100
         if rr > 5:
             risk_score += 2
         elif rr > 2:
@@ -3047,6 +3527,7 @@ async def ai_generate_multi_shift_summary(included_shifts: list[int]):
 
     total_plan = 0
     total_actual = 0
+    total_actual_pcs = 0
     total_downtime = 0
     total_production_hours = 0
     total_rejects = {"preform": 0, "bottle": 0, "cap": 0, "label": 0, "shrink": 0}
@@ -3089,6 +3570,9 @@ async def ai_generate_multi_shift_summary(included_shifts: list[int]):
 
         total_plan += shift_production_data["plan"]
         total_actual += shift_production_data["actual"]
+        total_actual_pcs += shift_production_data["actual"] * get_pcs_per_pack(
+            shift_production_data["product_type"]
+        )
         total_downtime += shift_dt_total
 
         # Accumulate category totals
@@ -3120,7 +3604,12 @@ async def ai_generate_multi_shift_summary(included_shifts: list[int]):
         else "N/A"
     )
     kpis = compute_kpis(
-        total_plan, total_actual, total_downtime, total_production_hours, total_rejects
+        total_plan,
+        total_actual,
+        total_downtime,
+        total_production_hours,
+        total_rejects,
+        total_actual_pcs,
     )
     total_available_minutes = total_production_hours * 60
     downtime_ratio = (
@@ -3144,8 +3633,8 @@ async def ai_generate_multi_shift_summary(included_shifts: list[int]):
         + total_rejects.get("cap", 0)
         + total_rejects.get("label", 0)
     )
-    if total_actual > 0:
-        rr = (total_reject_count / total_actual) * 100
+    if total_actual_pcs > 0:
+        rr = (total_reject_count / total_actual_pcs) * 100
         if rr > 5:
             risk_score += 2
         elif rr > 2:
@@ -4870,13 +5359,18 @@ async def remind_hourly_plan(context: ContextTypes.DEFAULT_TYPE):
     )
 
     # ✅ Capture result
-    success = await send_or_queue_reminder(context, text, parse_mode="Markdown")
+    meta = {"kind": "hourly_plan", "shift": shift, "hour": hour}
+    success = await send_or_queue_reminder(context, text, parse_mode="Markdown", meta=meta)
 
     # ✅ Write DB ONLY if message actually sent
     if success in ("sent", "queued"):
         bot_state_set(sched_key, "1")
         bot_state_set(catch_key, "1")
         logger.info(f"Hourly plan confirmed sent: Shift {shift} Hour {hour}")
+        # New hour started → remove the previous hour's plan + summary reminders
+        if success == "sent":
+            prev_shift, prev_hour = _previous_frame(shift, hour)
+            await delete_reminder_frame(context.bot, prev_shift, prev_hour)
     else:
         logger.warning(
             f"Hourly plan NOT marked sent (delivery failed): Shift {shift} Hour {hour}"
@@ -4921,7 +5415,12 @@ async def remind_hourly_summary(context: ContextTypes.DEFAULT_TYPE):
         + "- Operator notes\n\n"
         + "💡 AI will generate an hourly summary after you submit the data."
     )
-    result = await send_or_queue_reminder(context, text, parse_mode="Markdown")
+    result = await send_or_queue_reminder(
+        context,
+        text,
+        parse_mode="Markdown",
+        meta={"kind": "hourly_summary", "shift": shift, "hour": hour},
+    )
 
     # ✅ Only write DB keys if actually sent or queued (not failed)
     if result in ("sent", "queued"):
@@ -5142,6 +5641,7 @@ async def setup_bot_commands(app):
         BotCommand("shift_1_summary", "Shift 1 summary from hourly data"),
         BotCommand("shift_2_summary", "Shift 2 summary from hourly data"),
         BotCommand("all_shift_summary", "AI summary across both shifts"),
+        BotCommand("weekly_report", "Weekly production summary (Mon-Sun)"),
         BotCommand("bot_status", "Check bot status and reminder state"),
         BotCommand("line_off", "Set line OFF (queue all reminders)"),
         BotCommand("line_on", "Set line ON (flush queued reminders)"),
@@ -5335,9 +5835,17 @@ async def send_current_hour_plan(
         + "- Expected challenges"
     )
     try:
-        await bot.send_message(chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown")
+        sent = await bot.send_message(
+            chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown"
+        )
         bot_state_set(catch_key, "1")
         bot_state_set(sched_key, "1")
+        _record_reminder_message(
+            {"kind": "hourly_plan", "shift": current_shift_num, "hour": current_hour},
+            sent.message_id,
+        )
+        prev_shift, prev_hour = _previous_frame(current_shift_num, current_hour)
+        await delete_reminder_frame(bot, prev_shift, prev_hour)
         logger.info(
             f"Hourly plan sent (catchup{'/late' if force_if_late else ''}): "
             f"Shift {current_shift_num} Hour {current_hour}"
@@ -5400,12 +5908,20 @@ async def handle_partial_hours_on_line_resume(
                 + "💡 AI will generate an hourly summary after you submit the data."
             )
             try:
-                await bot.send_message(
+                sent = await bot.send_message(
                     chat_id=GROUP_CHAT_ID,
                     text=hourly_summary_text,
                     parse_mode="Markdown",
                 )
                 bot_state_set(key, "1")
+                _record_reminder_message(
+                    {
+                        "kind": "hourly_summary",
+                        "shift": current_shift_num,
+                        "hour": current_hour,
+                    },
+                    sent.message_id,
+                )
                 logger.info(
                     f"Partial hour summary reminder sent for Shift {current_shift_num}, Hour {current_hour} ({total_production_minutes} min production)"
                 )
@@ -5595,11 +6111,19 @@ async def catch_up_missed_reminders(app, current_shift_num: int, now: datetime):
                     + "💡 AI will generate an hourly summary after you submit the data."
                 )
                 try:
-                    await app.bot.send_message(
+                    sent = await app.bot.send_message(
                         chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown"
                     )
                     bot_state_set(sched_key, "1")
                     bot_state_set(catch_key, "1")
+                    _record_reminder_message(
+                        {
+                            "kind": "hourly_summary",
+                            "shift": current_shift_num,
+                            "hour": current_hour_num,
+                        },
+                        sent.message_id,
+                    )
                     logger.info(
                         f"[STARTUP-CATCHUP] Hourly summary sent: "
                         f"Shift {current_shift_num} Hr {current_hour_num}"
@@ -6707,6 +7231,7 @@ def main():
     app.add_handler(
         CommandHandler("all_shift_summary", all_shift_summary_from_hourly_cmd)
     )
+    app.add_handler(CommandHandler("weekly_report", weekly_report_cmd))
     app.add_handler(CommandHandler("bot_status", bot_status_cmd))
     app.add_handler(CommandHandler("line_off", line_off_cmd))
     app.add_handler(CommandHandler("line_on", line_on_cmd))
