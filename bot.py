@@ -54,16 +54,64 @@ load_dotenv()
 
 # Then access the variables
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID"))
+GROUP_CHAT_ID = int(os.getenv("GROUP_CHAT_ID")) if os.getenv("GROUP_CHAT_ID") else None
 EFFICIENCY_LIMIT = 75.0
 
-DB_CONFIG = {
+# Per-line configuration: one bot serving one group per production line,
+# each group writing to its own database. Keys follow the .env style:
+#   GROUP_CHAT_ID_1ltr, GROUP_CHAT_ID_2ltr, GROUP_CHAT_ID_0.6ltr, GROUP_CHAT_ID_0.3ltr
+#   DB_NAME_1ltr, DB_NAME_2ltr, DB_NAME_0.6ltr, DB_NAME_0.3ltr
+LINE_KEYS = ["1ltr", "2ltr", "0.6ltr", "0.3ltr"]
+
+
+def _line_env(suffix: str) -> str | None:
+    return os.getenv(f"{suffix}")
+
+
+def line_key_for_chat(chat_id: int) -> str | None:
+    for key in LINE_KEYS:
+        env_id = os.getenv(f"GROUP_CHAT_ID_{key}")
+        if env_id and str(chat_id) == env_id.strip():
+            return key
+    return None
+
+
+def is_allowed_chat(chat_id: int | None) -> bool:
+    """True only for chats mapped to a configured production line (allowlist)."""
+    return chat_id is not None and line_key_for_chat(chat_id) is not None
+
+
+def chat_id_for_line(line_key: str) -> int | None:
+    env_id = os.getenv(f"GROUP_CHAT_ID_{line_key}")
+    return int(env_id) if env_id else None
+
+
+def db_name_for_line(line_key: str) -> str | None:
+    return os.getenv(f"DB_NAME_{line_key}") or os.getenv("DB_NAME")
+
+
+def configured_lines() -> list[str]:
+    return [k for k in LINE_KEYS if chat_id_for_line(k) is not None and db_name_for_line(k)]
+
+
+def default_chat_id() -> int | None:
+    if GROUP_CHAT_ID:
+        return GROUP_CHAT_ID
+    lines = configured_lines()
+    return chat_id_for_line(lines[0]) if lines else None
+
+
+# Base DB credentials are shared across all line databases; only the database name differs.
+BASE_DB_CONFIG = {
     "host": os.getenv("DB_HOST"),
-    "database": os.getenv("DB_NAME"),
     "user": os.getenv("DB_USER"),
     "password": os.getenv("DB_PASSWORD"),
     "port": int(os.getenv("DB_PORT", 5432)),
 }
+if os.getenv("DB_NAME"):
+    BASE_DB_CONFIG["database"] = os.getenv("DB_NAME")
+
+DB_CONFIG = dict(BASE_DB_CONFIG)
 
 # # ---------------- AI CONFIG ----------------
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
@@ -80,36 +128,6 @@ ai_client = Groq(api_key=GROQ_API_KEY)
 #     api_key=QWEN_API_KEY,
 # )
 
-AI_SYSTEM_PROMPT = """
-You are a senior production audit AI for a beverage bottling plant.
-
-Your role:
-- Detect mechanical, electrical, process, and operator risks.
-- Identify repeated faults, chronic failures, and abnormal downtime.
-- Identify root-cause risk signals from downtime and operator notes.
-- Ask ONLY audit-grade diagnostic questions when risk exists.
-
-Rules:
-- Ask questions ONLY if downtime exists, efficiency < 75%, repeated machine faults appear,
-  or pre-summary messages lack necessary details.
-- Focus on: blower, molds, conveyors, bearings, sensors, alarms, rejects, VOS, power stability.
-- Questions must be short, professional, numbered, and investigation-oriented.
-- Do NOT summarize.
-- Do NOT provide solutions.
-- Treat operator comments as evidence.
-
-Stopping rule (MANDATORY):
-- If root cause is identified AND
-  corrective action is completed or scheduled AND
-  current status is "ready", "normal", or "no further issue",
-  respond with exactly: STOP
-- Do NOT ask questions about future shifts, plans, or targets.
-- Do NOT continue questioning once STOP is reached.
-
-Scope rule:
-- Audit applies ONLY to the reported shift.
-- Do NOT ask about next shifts, production targets, or planning.
-"""
 
 SUMMARY_SYSTEM_PROMPT = """
 You are the OFFICIAL production summary AI.
@@ -218,54 +236,92 @@ SHIFT_SCHEDULE = {
     1: {"plan_time": time(1, 5), "report_time": time(12, 55)},  # Ethiopian clock
     2: {"plan_time": time(13, 5), "report_time": time(0, 55)},  # Ethiopian clock
 }
-# ---------------- AI SUMMARY EVIDENCE ----------------
-ai_shift_evidence = {1: [], 2: []}
+# ---------------- PER-LINE RUNTIME ----------------
+# All in-memory shift/reminder/validation state is per production line,
+# keyed by the Telegram group chat_id of each line. A single bot process
+# serves all 4 line groups, so NO line may share state with another.
 
-# Store AI text summaries per shift for full-day aggregation
-daily_ai_shift_summaries = {
-    1: None,
-    2: None,
-}
+
+class LineRuntime:
+    """Mutable per-line runtime state (evidence, shift counters, reminders...)."""
+
+    __slots__ = (
+        "evidence",
+        "daily_summaries",
+        "current_shift",
+        "shift_closed",
+        "pending_reminders",
+        "plan_sent_today",
+        "last_plan_date",
+        "ai_block",
+        "line_state",
+        "off_since",
+        "active_validation_key",
+        "validation_sessions",
+        "hourly_summary_pending",
+        "shift_summary_pending",
+        "next_reminder_allowed",
+        "one_reminder_fired",
+        "shift_had_production",
+    )
+
+    def __init__(self):
+        self.evidence = {1: [], 2: []}
+        self.daily_summaries = {1: None, 2: None}
+        self.current_shift = 1
+        self.shift_closed = {1: False, 2: False}
+        self.pending_reminders = []
+        self.plan_sent_today = {1: None, 2: None}
+        self.last_plan_date = None
+        self.ai_block = False
+        self.line_state = LINE_STATE_RUNNING
+        self.off_since = None
+        self.active_validation_key = None
+        self.validation_sessions = {}
+        self.hourly_summary_pending = False
+        self.shift_summary_pending = None
+        self.next_reminder_allowed = True
+        self.one_reminder_fired = False
+        self.shift_had_production = {1: False, 2: False}
+
+
+_line_runtimes: dict[str, LineRuntime] = {}
+
+
+def line_runtime(chat_id: int | None = None) -> LineRuntime:
+    """Return the LineRuntime for a chat's production line.
+    Falls back to the first configured line (or a fresh default) when
+    the chat is unknown — keeps single-line deployments working."""
+    key = line_key_for_chat(chat_id) if chat_id is not None else None
+    if key is None:
+        lines = configured_lines()
+        key = lines[0] if lines else "1ltr"
+    rt = _line_runtimes.get(key)
+    if rt is None:
+        rt = LineRuntime()
+        _line_runtimes[key] = rt
+    return rt
+
+
+def line_runtime_for_line(line_key: str) -> LineRuntime:
+    key = line_key if line_key in LINE_KEYS else "1ltr"
+    rt = _line_runtimes.get(key)
+    if rt is None:
+        rt = LineRuntime()
+        _line_runtimes[key] = rt
+    return rt
+
+
 # ---------------- SHIFT / REMINDER STATE ----------------
-current_shift = 1  # starts at shift 1
-shift_closed = {1: False, 2: False}
+# Legacy module-level singletons are gone — use line_runtime() instead.
 
 # Line / sanitation / AI reminder gating
 LINE_STATE_RUNNING = "running"
 LINE_STATE_OFF = "line_off"
 LINE_STATE_SANITATION = "sanitation"
 
-line_state = LINE_STATE_RUNNING
-ai_reminder_block = False  # True while deep AI audit is active
-pending_reminders = []  # queued reminders while muted
-daily_plan_last_date = None  # date of last daily production plan reminder sent
-# At the top of your file, with your other globals
-active_validation_session_key: str | None = None
-# Track shift plan reminders sent per shift per day
-shift_plan_sent_today = {
-    1: None,  # date when sent, or None
-    2: None,
-}
-
-# Track when line went off (for calculating partial hours)
-line_off_since = None  # datetime when line went off
-
-# Suppression state for line-off / sanitation-on behavior:
-# After line goes OFF or sanitation starts, allow exactly ONE more scheduled reminder,
-# then suppress all remaining hourly reminders until line is ON again.
-line_off_next_reminder_allowed = True  # True = next reminder may fire; False = suppress
-line_off_one_reminder_fired = False  # True = the one allowed reminder already fired
-shift_had_production = {
-    1: False,
-    2: False,
-}  # per shift, any production before OFF?
-
 # ---------------- PRODUCTION VALIDATION STATE ----------------
-# Tracks per-user validation sessions that BLOCK summaries until resolved
-# Key: user_id or "shift_{shift}" or "hourly_{shift}_{hour}"
-# Value: dict with validation state
-validation_sessions = {}
-
+# Per-line validation is stored in LineRuntime.validation_sessions.
 MAX_VALIDATION_ROUNDS = 4  # Max back-and-forth before forcing verdict
 
 VALIDATION_ACCEPT_KEYWORDS = [
@@ -383,14 +439,28 @@ logger = logging.getLogger(__name__)
 
 
 # ---------------- DATABASE ----------------
-def get_db_connection():
-    """Get a fresh database connection"""
-    return psycopg2.connect(**DB_CONFIG)
+def db_config_for_chat(chat_id: int | None = None) -> dict:
+    """Return DB_CONFIG targeting the database for the given chat's production line.
+    Falls back to the default (legacy single-DB) config when no line is resolved."""
+    if chat_id is not None:
+        line = line_key_for_chat(chat_id)
+        if line:
+            name = db_name_for_line(line)
+            if name:
+                cfg = dict(BASE_DB_CONFIG)
+                cfg["database"] = name
+                return cfg
+    return dict(DB_CONFIG)
 
 
-def get_clean_db_connection():
+def get_db_connection(chat_id: int | None = None):
+    """Get a fresh database connection for the given chat's production line."""
+    return psycopg2.connect(**db_config_for_chat(chat_id))
+
+
+def get_clean_db_connection(chat_id: int | None = None):
     """Get a clean database connection, ensuring no aborted transactions"""
-    conn = psycopg2.connect(**DB_CONFIG)
+    conn = psycopg2.connect(**db_config_for_chat(chat_id))
     try:
         # Test if connection is clean by running a simple query
         cur = conn.cursor()
@@ -403,12 +473,12 @@ def get_clean_db_connection():
             conn.close()
         except:
             pass
-        return psycopg2.connect(**DB_CONFIG)
+        return psycopg2.connect(**db_config_for_chat(chat_id))
 
 
-def _ensure_bot_state_table():
+def _ensure_bot_state_table(chat_id: int | None = None):
     """Create bot_state table if it does not exist."""
-    conn = get_db_connection()
+    conn = get_db_connection(chat_id)
     cur = conn.cursor()
     try:
         cur.execute("""
@@ -427,10 +497,10 @@ def _ensure_bot_state_table():
         conn.close()
 
 
-def bot_state_get(key: str) -> str | None:
+def bot_state_get(key: str, chat_id: int | None = None) -> str | None:
     """Get value for a bot_state key. Returns None if not set."""
-    _ensure_bot_state_table()
-    conn = get_db_connection()
+    _ensure_bot_state_table(chat_id)
+    conn = get_db_connection(chat_id)
     cur = conn.cursor()
     try:
         cur.execute("SELECT value FROM bot_state WHERE key = %s", (key,))
@@ -444,10 +514,10 @@ def bot_state_get(key: str) -> str | None:
         conn.close()
 
 
-def bot_state_set(key: str, value: str) -> None:
+def bot_state_set(key: str, value: str, chat_id: int | None = None) -> None:
     """Set value for a bot_state key."""
-    _ensure_bot_state_table()
-    conn = get_db_connection()
+    _ensure_bot_state_table(chat_id)
+    conn = get_db_connection(chat_id)
     cur = conn.cursor()
     try:
         cur.execute(
@@ -467,21 +537,21 @@ def bot_state_set(key: str, value: str) -> None:
         conn.close()
 
 
-def load_bot_state_from_db() -> None:
-    """Load daily_plan_last_date, shift_plan_sent_today, line_state, line_off_since from DB."""
-    global daily_plan_last_date, shift_plan_sent_today, line_state, line_off_since
+def load_bot_state_from_db(chat_id: int | None = None) -> None:
+    """Load daily_plan_last_date, shift_plan_sent_today, line_state from the line's DB."""
+    rt = line_runtime(chat_id)
     try:
-        v = bot_state_get("daily_plan_last_date")
+        v = bot_state_get("daily_plan_last_date", chat_id)
         if v:
-            daily_plan_last_date = datetime.strptime(v, "%Y-%m-%d").date()
+            rt.last_plan_date = datetime.strptime(v, "%Y-%m-%d").date()
         for i in (1, 2):
-            v = bot_state_get(f"shift_plan_sent_{i}")
+            v = bot_state_get(f"shift_plan_sent_{i}", chat_id)
             if v:
-                shift_plan_sent_today[i] = datetime.strptime(v, "%Y-%m-%d").date()
-        v = bot_state_get("line_state")
+                rt.plan_sent_today[i] = datetime.strptime(v, "%Y-%m-%d").date()
+        v = bot_state_get("line_state", chat_id)
         if v and v in (LINE_STATE_RUNNING, LINE_STATE_OFF, LINE_STATE_SANITATION):
-            line_state = v
-        # line_off_since is not loaded (stays None after reboot) so partial-hour logic only uses current session
+            rt.line_state = v
+        # off_since is not loaded (stays None after reboot) so partial-hour logic only uses current session
         logger.info("Loaded bot state from database")
     except Exception as e:
         logger.warning(f"load_bot_state_from_db: {e}")
@@ -511,10 +581,11 @@ def parse_vos(text: str):
 
 
 def save_to_database(
-    data, downtime, rejects, vos_info=None, shift_override: int | None = None
+    data, downtime, rejects, vos_info=None, shift_override: int | None = None,
+    chat_id: int | None = None,
 ):
     """Save production data. Uses shift_override if provided (for /shift_summary_N)."""
-    conn = get_db_connection()
+    conn = get_db_connection(chat_id)
     cur = conn.cursor()
     shift = shift_override if shift_override is not None else data["shift"]
 
@@ -599,10 +670,10 @@ def save_to_database(
         conn.close()
 
 
-def _ensure_hourly_production_table():
+def _ensure_hourly_production_table(chat_id: int | None = None):
     """Create hourly_production + related tables if they don't exist.
     Also migrates old schemas (drops stale NOT NULL columns the code doesn't use)."""
-    conn = get_db_connection()
+    conn = get_db_connection(chat_id)
     cur = conn.cursor()
     try:
         # 1. Create tables if brand new
@@ -764,13 +835,14 @@ def save_hourly_to_database(
     hour_number: int,
     vos_info: str = None,
     shift_override: int = None,
+    chat_id: int | None = None,
 ) -> int | None:
     """
     Save ONE HOUR of production data to hourly_production table.
     Same pattern as save_to_database but for hourly granularity.
     """
-    _ensure_hourly_production_table()
-    conn = get_clean_db_connection()
+    _ensure_hourly_production_table(chat_id)
+    conn = get_clean_db_connection(chat_id)
     cur = conn.cursor()
     shift = shift_override if shift_override is not None else data["shift"]
     available_time = data.get("available_time") or 60
@@ -1129,75 +1201,6 @@ def compute_kpis(
     }
 
 
-# ---------------- AI SESSION ----------------
-user_ai_sessions = {}
-active_users = set()
-MAX_AI_QUESTIONS = 6
-user_audit_state = {}
-READY_KEYWORDS = [
-    "all are ready",
-    "ready to produce",
-    "production ready",
-    "normal",
-    "completed",
-    "issue resolved",
-    "replacement completed",
-    "we are ready",
-    "no further issue",
-]
-
-
-def audit_should_stop(user_id: int, message_text: str) -> bool:
-    text = message_text.lower()
-    if user_id not in user_audit_state:
-        user_audit_state[user_id] = {"questions": 0, "completed": False}
-    if any(k in text for k in READY_KEYWORDS):
-        user_audit_state[user_id]["completed"] = True
-        return True
-    if user_audit_state[user_id]["questions"] >= MAX_AI_QUESTIONS:
-        user_audit_state[user_id]["completed"] = True
-        return True
-    return False
-
-
-async def generate_ai_questions_for_message(user_id, message_text):
-    if user_id not in user_ai_sessions:
-        user_ai_sessions[user_id] = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
-    prompt = f"""
-Operator message:
-{message_text}
-
-Rules:
-- Ask only ONE concise, numbered audit-grade diagnostic question if details are missing.
-- Do not summarize, do not give solutions.
-- Focus on potential risks, repeated faults, abnormal conditions.
-- Limit strictly to 1 question.
-"""
-    user_ai_sessions[user_id].append({"role": "user", "content": prompt})
-    try:
-        response = ai_client.chat.completions.create(
-            model=AI_MODEL, messages=user_ai_sessions[user_id]
-        )
-        ai_msg = response.choices[0].message.content.strip()
-        if ai_msg.upper().strip() == "STOP":
-            user_ai_sessions[user_id].append({"role": "assistant", "content": "STOP"})
-            return "STOP"
-        first_question = ""
-        for line in ai_msg.split("\n"):
-            if re.match(r"^\d+\.", line.strip()):
-                first_question = line.strip()
-                break
-        if not first_question and ai_msg:
-            first_question = ai_msg
-        user_ai_sessions[user_id].append(
-            {"role": "assistant", "content": first_question}
-        )
-        return first_question
-    except Exception as e:
-        logger.error(f"AI API error: {e}")
-        return None
-
-
 # ---------------- SHIFT CALCULATION (BY CLOCK) ----------------
 def now_ethiopia() -> datetime:
     """
@@ -1232,6 +1235,7 @@ async def send_or_queue_reminder(
     text: str,
     parse_mode: str | None = "Markdown",
     meta: dict | None = None,
+    chat_id: int | None = None,
 ) -> str:
     """
     Central dispatch for all scheduled reminders.
@@ -1257,10 +1261,12 @@ async def send_or_queue_reminder(
 
     AI audit block: queues ALL reminders (flush on audit end).
     """
-    global \
-        pending_reminders, \
-        line_off_next_reminder_allowed, \
-        line_off_one_reminder_fired
+    rt = line_runtime(chat_id)
+    if chat_id is None:
+        chat_id = default_chat_id()
+        if chat_id is None:
+            logger.error("send_or_queue_reminder: no chat_id available")
+            return "failed"
 
     now = now_ethiopia()
     shift_now = get_shift_for_time(now)
@@ -1278,12 +1284,12 @@ async def send_or_queue_reminder(
     )
 
     # ── Line state checks ───────────────────────────────────────────────────
-    line_is_inactive = line_state != LINE_STATE_RUNNING
+    line_is_inactive = rt.line_state != LINE_STATE_RUNNING
 
     if line_is_inactive:
         # CASE 1: Line was OFF/sanitation ON the ENTIRE shift (no production at all).
         # Suppress everything including summaries.
-        if not shift_had_production.get(shift_now, False):
+        if not rt.shift_had_production.get(shift_now, False):
             logger.info(
                 f"[SUPPRESS-CASE1] Entire shift inactive, no production — "
                 f"suppressing: Shift {shift_now} | {text[:60]}"
@@ -1303,9 +1309,9 @@ async def send_or_queue_reminder(
         elif is_hourly_summary:
             # Hourly summary: apply one-reminder rule.
             # Allow the FIRST one after OFF, suppress the rest.
-            if line_off_next_reminder_allowed and not line_off_one_reminder_fired:
-                line_off_one_reminder_fired = True
-                line_off_next_reminder_allowed = False
+            if rt.next_reminder_allowed and not rt.one_reminder_fired:
+                rt.one_reminder_fired = True
+                rt.next_reminder_allowed = False
                 logger.info(
                     f"[ALLOW-ONE] First reminder after OFF — "
                     f"Shift {shift_now} hourly summary allowed"
@@ -1322,9 +1328,9 @@ async def send_or_queue_reminder(
             # Planning reminders: always suppressed when line is inactive.
             # Exception: if this is the ONE allowed reminder slot and nothing has fired yet,
             # let a plan reminder through (e.g. OFF happened right before :02 plan time).
-            if line_off_next_reminder_allowed and not line_off_one_reminder_fired:
-                line_off_one_reminder_fired = True
-                line_off_next_reminder_allowed = False
+            if rt.next_reminder_allowed and not rt.one_reminder_fired:
+                rt.one_reminder_fired = True
+                rt.next_reminder_allowed = False
                 logger.info(
                     f"[ALLOW-ONE] First reminder after OFF (plan) — "
                     f"Shift {shift_now} allowed"
@@ -1332,7 +1338,7 @@ async def send_or_queue_reminder(
                 # Fall through to send below.
             else:
                 logger.info(
-                    f"[SUPPRESS] Planning reminder suppressed (line {line_state}): "
+                    f"[SUPPRESS] Planning reminder suppressed (line {rt.line_state}): "
                     f"Shift {shift_now}"
                 )
                 return "suppressed"
@@ -1343,8 +1349,8 @@ async def send_or_queue_reminder(
             return "suppressed"
 
     # ── AI audit block: queue (but never drop) ─────────────────────────────
-    if ai_reminder_block:
-        pending_reminders.append(
+    if rt.ai_block:
+        rt.pending_reminders.append(
             {
                 "text": text,
                 "parse_mode": parse_mode,
@@ -1366,12 +1372,12 @@ async def send_or_queue_reminder(
     )
     try:
         sent = await context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
+            chat_id=chat_id,
             text=text,
             parse_mode=parse_mode,
         )
         if meta:
-            _record_reminder_message(meta, sent.message_id)
+            _record_reminder_message(meta, sent.message_id, chat_id)
         return "sent"
     except Exception as e:
         logger.error(f"Telegram send failed: {e}")
@@ -1383,14 +1389,14 @@ def _reminder_msg_key(kind: str, shift: int, hour: int) -> str:
     return f"reminder_msg_{kind}_{shift}_{hour}"
 
 
-def _record_reminder_message(meta: dict, message_id: int) -> None:
+def _record_reminder_message(meta: dict, message_id: int, chat_id: int | None = None) -> None:
     """Store the Telegram message_id of a sent hourly reminder for later deletion."""
     kind = meta.get("kind")
     shift = meta.get("shift")
     hour = meta.get("hour")
     if not kind or not shift or not hour:
         return
-    bot_state_set(_reminder_msg_key(kind, shift, hour), str(message_id))
+    bot_state_set(_reminder_msg_key(kind, shift, hour), str(message_id), chat_id)
     logger.info(f"Tracked reminder message: {kind} shift={shift} hour={hour} id={message_id}")
 
 
@@ -1402,36 +1408,40 @@ def _previous_frame(shift: int, hour: int) -> tuple:
     return prev_shift, 12
 
 
-async def delete_reminder_frame(bot, shift: int, hour: int) -> None:
+async def delete_reminder_frame(bot, shift: int, hour: int, chat_id: int | None = None) -> None:
     """
     Delete the hourly plan + summary reminder messages of a given (shift, hour) frame.
     Failures (already deleted, too old, network) are logged and ignored — never crashes.
     """
+    if chat_id is None:
+        chat_id = default_chat_id()
     for kind in ("hourly_plan", "hourly_summary"):
         key = _reminder_msg_key(kind, shift, hour)
-        msg_id_str = bot_state_get(key)
+        msg_id_str = bot_state_get(key, chat_id)
         if not msg_id_str:
             continue
         try:
-            await bot.delete_message(chat_id=GROUP_CHAT_ID, message_id=int(msg_id_str))
+            await bot.delete_message(chat_id=chat_id, message_id=int(msg_id_str))
             logger.info(f"Deleted old {kind} reminder shift={shift} hour={hour} (id={msg_id_str})")
         except Exception as e:
             logger.warning(
                 f"Could not delete {kind} reminder shift={shift} hour={hour} (id={msg_id_str}): {e}"
             )
-        bot_state_set(key, "")
+        bot_state_set(key, "", chat_id)
 
 
-async def flush_pending_reminders(bot, reason: str | None = None) -> None:
+async def flush_pending_reminders(bot, reason: str | None = None, chat_id: int | None = None) -> None:
     """
     Flush queued reminders.
     - reason="ai":   send ALL AI-muted reminders regardless of time/shift
     - reason="line": send AI-muted reminders only; drop all line-muted items (no backlog)
     Expired hourly plan/summary items (frame already passed) are dropped, never sent.
     """
-    global pending_reminders
+    rt = line_runtime(chat_id)
+    if chat_id is None:
+        chat_id = default_chat_id()
 
-    if not pending_reminders:
+    if not rt.pending_reminders:
         return
 
     now = now_ethiopia()
@@ -1441,7 +1451,7 @@ async def flush_pending_reminders(bot, reason: str | None = None) -> None:
     to_send = []
     remaining = []
 
-    for item in pending_reminders:
+    for item in rt.pending_reminders:
         meta = item.get("meta")
         if meta and meta.get("kind") in ("hourly_plan", "hourly_summary"):
             item_shift = meta.get("shift")
@@ -1464,7 +1474,7 @@ async def flush_pending_reminders(bot, reason: str | None = None) -> None:
                 to_send.append(item)
             # line-muted items are intentionally dropped here — no else/remaining
 
-    pending_reminders = remaining  # only non-AI items remain (empty for reason="line")
+    rt.pending_reminders = remaining  # only non-AI items remain (empty for reason="line")
 
     if not to_send:
         return
@@ -1490,18 +1500,18 @@ async def flush_pending_reminders(bot, reason: str | None = None) -> None:
     for item in to_send:
         try:
             sent = await bot.send_message(
-                chat_id=GROUP_CHAT_ID,
+                chat_id=chat_id,
                 text=item["text"],
                 parse_mode=item.get("parse_mode"),
             )
             meta = item.get("meta")
             if meta:
-                _record_reminder_message(meta, sent.message_id)
+                _record_reminder_message(meta, sent.message_id, chat_id)
                 if meta.get("kind") == "hourly_plan":
                     prev_shift, prev_hour = _previous_frame(
                         meta["shift"], meta["hour"]
                     )
-                    await delete_reminder_frame(bot, prev_shift, prev_hour)
+                    await delete_reminder_frame(bot, prev_shift, prev_hour, chat_id)
             await asyncio.sleep(0.5)
         except Exception as e:
             logger.error(f"flush_pending_reminders: failed to send item: {e}")
@@ -1512,7 +1522,7 @@ _last_successful_send: datetime | None = None
 _recovery_task_running = False
 
 
-async def recover_missed_reminders_on_reconnect(app) -> None:
+async def recover_missed_reminders_on_reconnect(app, chat_id: int | None = None) -> None:
     """
     Called when internet reconnects. Sends ONLY reminders still inside their
     valid time windows. If current time is outside a reminder's window, skip
@@ -1525,6 +1535,12 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
               → planning reminders suppressed, summaries still fire
     - Line running normally → all reminders fire normally
     """
+    rt = line_runtime(chat_id)
+    if chat_id is None:
+        chat_id = default_chat_id()
+        if chat_id is None:
+            logger.error("recover_missed_reminders_on_reconnect: no chat_id")
+            return
     now = now_ethiopia()
     today_iso = now.date().isoformat()
     current_shift_num = get_shift_for_time(now)
@@ -1537,17 +1553,17 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
         start = 19 * 60
     minutes_into_shift = current_minutes - start
 
-    line_is_active = line_state == LINE_STATE_RUNNING
+    line_is_active = rt.line_state == LINE_STATE_RUNNING
 
     # Check if this shift had ANY production at all
     # Checks both in-memory (survives within session) and DB (survives restart)
-    shift_has_production = shift_had_production.get(
+    shift_has_production = rt.shift_had_production.get(
         current_shift_num, False
-    ) or _shift_had_any_production(current_shift_num, today_iso)
+    ) or _shift_had_any_production(current_shift_num, today_iso, chat_id)
 
     logger.info(
         f"[RECOVERY] Reconnected at {now.strftime('%H:%M')} "
-        f"Shift {current_shift_num} | line_state={line_state} | "
+        f"Shift {current_shift_num} | line_state={rt.line_state} | "
         f"shift_has_production={shift_has_production}"
     )
 
@@ -1565,8 +1581,8 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
     # ── 1. Daily Plan ────────────────────────────────────────────────────────
     # Planning reminder — only send if line is currently active
     if line_is_active:
-        if not bot_state_get(f"daily_plan_{today_iso}") and not bot_state_get(
-            f"daily_plan_catchup_{today_iso}"
+        if not bot_state_get(f"daily_plan_{today_iso}", chat_id) and not bot_state_get(
+            f"daily_plan_catchup_{today_iso}", chat_id
         ):
             header = f"📅 {format_date_time_12h(now)}\n\n"
             text = (
@@ -1579,13 +1595,12 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
             )
             try:
                 await app.bot.send_message(
-                    chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown"
+                    chat_id=chat_id, text=text, parse_mode="Markdown"
                 )
-                bot_state_set(f"daily_plan_{today_iso}", "1")
-                bot_state_set(f"daily_plan_catchup_{today_iso}", "1")
-                global daily_plan_last_date
-                daily_plan_last_date = now.date()
-                bot_state_set("daily_plan_last_date", today_iso)
+                bot_state_set(f"daily_plan_{today_iso}", "1", chat_id)
+                bot_state_set(f"daily_plan_catchup_{today_iso}", "1", chat_id)
+                rt.last_plan_date = now.date()
+                bot_state_set("daily_plan_last_date", today_iso, chat_id)
                 sent_count += 1
                 await asyncio.sleep(1)
                 logger.info("[RECOVERY] Daily plan sent")
@@ -1601,9 +1616,9 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
         fired_key = f"shift_plan_fired_{today_iso}_{current_shift_num}"
         catch_key = f"shift_plan_catchup_{today_iso}_{current_shift_num}"
         if (
-            not bot_state_get(recovery_key)
-            and not bot_state_get(fired_key)
-            and not bot_state_get(catch_key)
+            not bot_state_get(recovery_key, chat_id)
+            and not bot_state_get(fired_key, chat_id)
+            and not bot_state_get(catch_key, chat_id)
         ):
             header = f"📅 {format_date_time_12h(now)}\n\n"
             text = (
@@ -1615,12 +1630,11 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
             )
             try:
                 await app.bot.send_message(
-                    chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown"
+                    chat_id=chat_id, text=text, parse_mode="Markdown"
                 )
-                bot_state_set(recovery_key, "1")
-                bot_state_set(fired_key, "1")
-                global shift_plan_sent_today
-                shift_plan_sent_today[current_shift_num] = now.date()
+                bot_state_set(recovery_key, "1", chat_id)
+                bot_state_set(fired_key, "1", chat_id)
+                rt.plan_sent_today[current_shift_num] = now.date()
                 sent_count += 1
                 await asyncio.sleep(1)
                 logger.info(f"[RECOVERY] Shift {current_shift_num} plan sent")
@@ -1642,7 +1656,7 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
         catch_key = f"hourly_plan_{today_iso}_{current_shift_num}_{current_hour_num}"
         # Only check catch_key — sched_key may have been written while line was OFF
         # (scheduler ran but message was suppressed), so it's not a reliable sent indicator
-        if not bot_state_get(catch_key) and is_in_hourly_plan_window(
+        if not bot_state_get(catch_key, chat_id) and is_in_hourly_plan_window(
             current_shift_num, current_hour_num, now
         ):
             header = f"📅 {format_date_time_12h(now)}\n\n"
@@ -1657,10 +1671,10 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
             )
             try:
                 sent = await app.bot.send_message(
-                    chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown"
+                    chat_id=chat_id, text=text, parse_mode="Markdown"
                 )
-                bot_state_set(sched_key, "1")
-                bot_state_set(catch_key, "1")
+                bot_state_set(sched_key, "1", chat_id)
+                bot_state_set(catch_key, "1", chat_id)
                 _record_reminder_message(
                     {
                         "kind": "hourly_plan",
@@ -1668,9 +1682,10 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
                         "hour": current_hour_num,
                     },
                     sent.message_id,
+                    chat_id,
                 )
                 prev_shift, prev_hour = _previous_frame(current_shift_num, current_hour_num)
-                await delete_reminder_frame(app.bot, prev_shift, prev_hour)
+                await delete_reminder_frame(app.bot, prev_shift, prev_hour, chat_id)
                 sent_count += 1
                 await asyncio.sleep(1)
                 logger.info(
@@ -1694,7 +1709,7 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
             catch_key = (
                 f"hourly_summary_{today_iso}_{current_shift_num}_{current_hour_num}"
             )
-            if not bot_state_get(sched_key) and not bot_state_get(catch_key):
+            if not bot_state_get(sched_key, chat_id) and not bot_state_get(catch_key, chat_id):
                 header = f"📅 {format_date_time_12h(now)}\n\n"
                 text = (
                     header
@@ -1709,10 +1724,10 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
                 )
                 try:
                     sent = await app.bot.send_message(
-                        chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown"
+                        chat_id=chat_id, text=text, parse_mode="Markdown"
                     )
-                    bot_state_set(sched_key, "1")
-                    bot_state_set(catch_key, "1")
+                    bot_state_set(sched_key, "1", chat_id)
+                    bot_state_set(catch_key, "1", chat_id)
                     _record_reminder_message(
                         {
                             "kind": "hourly_summary",
@@ -1720,6 +1735,7 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
                             "hour": current_hour_num,
                         },
                         sent.message_id,
+                        chat_id,
                     )
                     sent_count += 1
                     await asyncio.sleep(1)
@@ -1742,7 +1758,7 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
         if shift_has_production:
             fired_key = f"shift_report_fired_{today_iso}_{current_shift_num}"
             recovery_key = f"shift_report_recovery_{today_iso}_{current_shift_num}"
-            if not bot_state_get(fired_key) and not bot_state_get(recovery_key):
+            if not bot_state_get(fired_key, chat_id) and not bot_state_get(recovery_key, chat_id):
                 header = f"📅 {format_date_time_12h(now)}\n\n"
                 text = (
                     header
@@ -1754,10 +1770,10 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
                 )
                 try:
                     await app.bot.send_message(
-                        chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown"
+                        chat_id=chat_id, text=text, parse_mode="Markdown"
                     )
-                    bot_state_set(recovery_key, "1")
-                    bot_state_set(fired_key, "1")
+                    bot_state_set(recovery_key, "1", chat_id)
+                    bot_state_set(fired_key, "1", chat_id)
                     sent_count += 1
                     await asyncio.sleep(1)
                     logger.info(f"[RECOVERY] Shift {current_shift_num} report sent")
@@ -1769,7 +1785,7 @@ async def recover_missed_reminders_on_reconnect(app) -> None:
                 f"[RECOVERY] Shift {current_shift_num} summary skipped "
                 f"— no production this shift"
             )
-            bot_state_set(f"shift_report_fired_{today_iso}_{current_shift_num}", "1")
+            bot_state_set(f"shift_report_fired_{today_iso}_{current_shift_num}", "1", chat_id)
 
     if sent_count > 0:
         logger.info(f"[RECOVERY] Sent {sent_count} missed reminder(s)")
@@ -1797,10 +1813,13 @@ async def connection_watchdog(app) -> None:
                     "[WATCHDOG] Connection restored! Running missed reminder recovery..."
                 )
                 was_offline = False
-                try:
-                    await recover_missed_reminders_on_reconnect(app)
-                except Exception as e:
-                    logger.error(f"[WATCHDOG] Recovery failed: {e}")
+                for line_chat in (chat_id_for_line(k) for k in configured_lines()):
+                    try:
+                        await recover_missed_reminders_on_reconnect(app, line_chat)
+                    except Exception as e:
+                        logger.error(
+                            f"[WATCHDOG] Recovery failed for chat {line_chat}: {e}"
+                        )
             _last_successful_send = now_ethiopia()
         except Exception as e:
             if not was_offline:
@@ -1809,52 +1828,20 @@ async def connection_watchdog(app) -> None:
 
 
 # ---------------- COMMANDS ----------------
-async def start_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ai_reminder_block
-
-    user_id = update.effective_user.id
-    active_users.add(user_id)
-    user_ai_sessions[user_id] = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
-    user_audit_state[user_id] = {"questions": 0, "completed": False, "ended": False}
-
-    # While AI audit is active, silence all shift / hourly reminders (they will be queued)
-    ai_reminder_block = True
-
-    await update.message.reply_text(
-        "✅ Audit triggered. Send shift reports. Use /end_audit to stop.\n"
-        "🔇 While AI audit is active, all production reminders will be queued."
-    )
-
-
-async def end_audit(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global ai_reminder_block
-
-    user_id = update.effective_user.id
-    active_users.discard(user_id)
-    user_ai_sessions.pop(user_id, None)
-    user_audit_state.pop(user_id, None)
-
-    # Re‑enable reminders and flush anything that was queued for AI
-    ai_reminder_block = False
-    await update.message.reply_text(
-        "🛑 Audit ended. AI questioning stopped.\n📣 Sending any queued reminders."
-    )
-    await flush_pending_reminders(context.bot, reason="ai")
-
-
 async def _do_shift_summary(
     update: Update, context: ContextTypes.DEFAULT_TYPE, shift: int
 ):
     """Shared logic for shift summary. Post to Telegram group and save to PostgreSQL."""
-    global daily_ai_shift_summaries
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    rt = line_runtime(chat_id)
 
     if shift not in [1, 2]:
         await update.message.reply_text("Shift must be 1 or 2.")
         return
 
-    if not ai_shift_evidence[shift]:
+    if not rt.evidence[shift]:
         await context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
+            chat_id=chat_id,
             text=f"📊 SHIFT {shift} OFFICIAL SUMMARY\n\n⚠️ Shift summary is not provided.",
         )
         await update.message.reply_text(f"⚠️ Shift {shift} summary is not provided.")
@@ -1865,7 +1852,7 @@ async def _do_shift_summary(
     downtime = []
     rejects = {}
     vos_info = None
-    for text in reversed(ai_shift_evidence[shift]):
+    for text in reversed(rt.evidence[shift]):
         try:
             production_data = parse_report(text)
             categorized_dt = parse_downtime_categorized(text)
@@ -1879,23 +1866,23 @@ async def _do_shift_summary(
         try:
             # Use requested shift (not parsed) to avoid wrong date/shift from mixed evidence
             save_to_database(
-                production_data, downtime, rejects, vos_info, shift_override=shift
+                production_data, downtime, rejects, vos_info, shift_override=shift, chat_id=chat_id
             )
             logger.info(f"Shift {shift} data saved to database")
         except Exception as e:
             logger.error(f"Failed to save shift {shift} to database: {e}")
 
-    ai_text = await ai_generate_summary(shift)
-    daily_ai_shift_summaries[shift] = ai_text
+    ai_text = await ai_generate_summary(shift, chat_id)
+    rt.daily_summaries[shift] = ai_text
 
     # Send without parse_mode - AI content often contains _*[] that break Markdown
     await split_and_send_long_message(
-        context.bot, GROUP_CHAT_ID,
+        context.bot, chat_id,
         f"📊 SHIFT {shift} OFFICIAL SUMMARY\n\n{ai_text}",
     )
 
-    shift_closed[shift] = True
-    ai_shift_evidence[shift] = []
+    rt.shift_closed[shift] = True
+    rt.evidence[shift] = []
 
 
 async def shift_summary(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1945,6 +1932,8 @@ async def shift_summary_from_hourly_cmd(
         await update.message.reply_text("Shift must be 1 or 2.")
         return
 
+    chat_id = update.effective_chat.id if update.effective_chat else None
+
     # Parse optional date - if no date provided, find most recent data
     target_date = None
     date_label = "most recent"
@@ -1963,7 +1952,7 @@ async def shift_summary_from_hourly_cmd(
             return
     else:
         # Find most recent date with hourly data for this shift
-        conn = get_db_connection()
+        conn = get_db_connection(chat_id)
         try:
             cur = conn.cursor()
             cur.execute(
@@ -2009,12 +1998,13 @@ async def shift_summary_from_hourly_cmd(
         f"⏳ Generating Shift {shift} summary from hourly data ({date_label})..."
     )
 
-    # Temporarily load into ai_shift_evidence so ai_generate_summary works
-    original_evidence = list(ai_shift_evidence[shift])
-    ai_shift_evidence[shift] = [text_blob]
+    # Temporarily load into rt.evidence so ai_generate_summary works
+    rt = line_runtime(chat_id)
+    original_evidence = list(rt.evidence[shift])
+    rt.evidence[shift] = [text_blob]
     try:
-        ai_text = await ai_generate_summary(shift)
-        daily_ai_shift_summaries[shift] = ai_text
+        ai_text = await ai_generate_summary(shift, chat_id)
+        rt.daily_summaries[shift] = ai_text
 
         # Also save the aggregated data to the main production table
         try:
@@ -2023,7 +2013,9 @@ async def shift_summary_from_hourly_cmd(
             dt_flat = flatten_categorized_downtime(cat_dt)
             rej = parse_rejects(text_blob)
             vos = parse_vos(text_blob)
-            save_to_database(prod, dt_flat, rej, vos_info=vos, shift_override=shift)
+            save_to_database(
+                prod, dt_flat, rej, vos_info=vos, shift_override=shift, chat_id=chat_id
+            )
             logger.info(
                 f"Aggregated hourly→shift data saved to production table: shift={shift}"
             )
@@ -2031,15 +2023,15 @@ async def shift_summary_from_hourly_cmd(
             logger.warning(f"Failed to save aggregated shift data: {e}")
 
         await split_and_send_long_message(
-            context.bot, GROUP_CHAT_ID,
+            context.bot, chat_id,
             f"📊 SHIFT {shift} SUMMARY (from hourly data — {date_label})\n\n{ai_text}",
         )
-        shift_closed[shift] = True
+        rt.shift_closed[shift] = True
     except Exception as e:
         logger.error(f"Error generating shift summary from hourly: {e}")
         await update.message.reply_text(f"❌ Error: {e}")
     finally:
-        ai_shift_evidence[shift] = original_evidence
+        rt.evidence[shift] = original_evidence
 
 
 # async def shift_summary_hourly_1_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2062,7 +2054,8 @@ async def _generate_shift_summary_from_recent_hourly(
 ):
     """Generate shift summary from most recent hourly data for the specified shift"""
     # Find the most recent date with hourly data for this shift
-    conn = get_db_connection()
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    conn = get_db_connection(chat_id)
     try:
         cur = conn.cursor()
         cur.execute(
@@ -2089,7 +2082,7 @@ async def _generate_shift_summary_from_recent_hourly(
         date_label = recent_date.strftime("%d/%m/%Y")
 
         # Load aggregated hourly data for this shift and date
-        text_blob = load_shift_evidence_from_hourly_db(shift, recent_date)
+        text_blob = load_shift_evidence_from_hourly_db(shift, recent_date, chat_id)
         if not text_blob:
             await update.message.reply_text(
                 f"⚠️ Error loading hourly data for Shift {shift} on {date_label}."
@@ -2100,12 +2093,13 @@ async def _generate_shift_summary_from_recent_hourly(
             f"⏳ Generating Shift {shift} summary from hourly data ({date_label}) - {hour_count} hour(s) found..."
         )
 
-        # Temporarily load into ai_shift_evidence so ai_generate_summary works
-        original_evidence = list(ai_shift_evidence[shift])
-        ai_shift_evidence[shift] = [text_blob]
+        # Temporarily load into rt.evidence so ai_generate_summary works
+        rt = line_runtime(chat_id)
+        original_evidence = list(rt.evidence[shift])
+        rt.evidence[shift] = [text_blob]
         try:
-            ai_text = await ai_generate_summary(shift)
-            daily_ai_shift_summaries[shift] = ai_text
+            ai_text = await ai_generate_summary(shift, chat_id)
+            rt.daily_summaries[shift] = ai_text
 
             # Also save the aggregated data to the main production table
             try:
@@ -2114,7 +2108,9 @@ async def _generate_shift_summary_from_recent_hourly(
                 dt_flat = flatten_categorized_downtime(cat_dt)
                 rej = parse_rejects(text_blob)
                 vos = parse_vos(text_blob)
-                save_to_database(prod, dt_flat, rej, vos_info=vos, shift_override=shift)
+                save_to_database(
+                    prod, dt_flat, rej, vos_info=vos, shift_override=shift, chat_id=chat_id
+                )
                 logger.info(
                     f"Aggregated hourly→shift data saved to production table: shift={shift}"
                 )
@@ -2122,15 +2118,15 @@ async def _generate_shift_summary_from_recent_hourly(
                 logger.warning(f"Failed to save aggregated shift data: {e}")
 
             await split_and_send_long_message(
-                context.bot, GROUP_CHAT_ID,
+                context.bot, chat_id,
                 f"📊 SHIFT {shift} SUMMARY (from hourly data — {date_label})\n\n{ai_text}",
             )
-            shift_closed[shift] = True
+            rt.shift_closed[shift] = True
         except Exception as e:
             logger.error(f"Error generating shift summary from hourly: {e}")
             await update.message.reply_text(f"❌ Error: {e}")
         finally:
-            ai_shift_evidence[shift] = original_evidence
+            rt.evidence[shift] = original_evidence
 
     except Exception as e:
         logger.error(f"Database error: {e}")
@@ -2147,6 +2143,9 @@ async def all_shift_summary_from_hourly_cmd(
     Generate a multi-shift summary by aggregating hourly data for ALL shifts from the DB.
     Date is optional (DD/MM/YY), defaults to most recent date in database.
     """
+    if not is_allowed_chat(update.effective_chat.id if update.effective_chat else None):
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else None
     target_date = None
     if context.args:
         raw = context.args[0].strip()
@@ -2162,7 +2161,7 @@ async def all_shift_summary_from_hourly_cmd(
 
     # If no date specified, get the most recent date from database
     if target_date is None:
-        target_date = get_latest_hourly_date_for_all_shifts()
+        target_date = get_latest_hourly_date_for_all_shifts(chat_id=chat_id)
         if target_date is None:
             await update.message.reply_text(
                 "⚠️ No hourly data found in database. Submit some reports first."
@@ -2178,7 +2177,7 @@ async def all_shift_summary_from_hourly_cmd(
 
     if len(shifts_found) < 2:
         # Fall back: try main production table
-        db_evidence = load_shift_evidence_from_db(target_date)
+        db_evidence = load_shift_evidence_from_db(target_date, chat_id)
         db_shifts = [s for s in (1, 2) if db_evidence.get(s)]
 
         if len(db_shifts) >= 2:
@@ -2186,14 +2185,15 @@ async def all_shift_summary_from_hourly_cmd(
                 f"⚠️ Only {len(shifts_found)} shift(s) with hourly data for {date_label}.\n"
                 f"Falling back to shift-level data ({len(db_shifts)} shifts found)..."
             )
-            original_evidence = {k: list(v) for k, v in ai_shift_evidence.items()}
+            rt_db = line_runtime(chat_id)
+            original_evidence = {k: list(v) for k, v in rt_db.evidence.items()}
             for s in (1, 2):
-                ai_shift_evidence[s] = db_evidence.get(s, [])
+                rt_db.evidence[s] = db_evidence.get(s, [])
             try:
-                await generate_multi_shift_summary_and_post(context, db_shifts)
+                await generate_multi_shift_summary_and_post(context, db_shifts, chat_id)
             finally:
                 for s in (1, 2):
-                    ai_shift_evidence[s] = original_evidence[s]
+                    rt_db.evidence[s] = original_evidence[s]
             return
         else:
             await update.message.reply_text(
@@ -2217,19 +2217,20 @@ async def all_shift_summary_from_hourly_cmd(
             dt_flat = flatten_categorized_downtime(cat_dt)
             rej = parse_rejects(text_blob)
             vos = parse_vos(text_blob)
-            save_to_database(prod, dt_flat, rej, vos_info=vos, shift_override=s)
+            save_to_database(prod, dt_flat, rej, vos_info=vos, shift_override=s, chat_id=chat_id)
         except Exception as e:
             logger.warning(f"Failed to save aggregated shift {s}: {e}")
 
-    # Swap into ai_shift_evidence temporarily
-    original_evidence = {k: list(v) for k, v in ai_shift_evidence.items()}
+    # Swap into rt.evidence temporarily
+    rt_swap = line_runtime(chat_id)
+    original_evidence = {k: list(v) for k, v in rt_swap.evidence.items()}
     for s in (1, 2):
-        ai_shift_evidence[s] = hourly_evidence.get(s, [])
+        rt_swap.evidence[s] = hourly_evidence.get(s, [])
     try:
-        await generate_multi_shift_summary_and_post(context, shifts_found)
+        await generate_multi_shift_summary_and_post(context, shifts_found, chat_id)
     finally:
         for s in (1, 2):
-            ai_shift_evidence[s] = original_evidence[s]
+            rt_swap.evidence[s] = original_evidence[s]
 
 
 async def shift_summary_2_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -2242,7 +2243,8 @@ async def shift_summary_3_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE
 
 async def shift_input_1_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Two-step: ask user to paste Shift 1 report next."""
-    context.user_data["shift_summary_pending"] = 1
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    line_runtime(chat_id).shift_summary_pending = 1
     await update.message.reply_text(
         "✅ Shift set to 1.\n\n"
         "Now send your Shift 1 report in the next message (same format you normally paste).\n"
@@ -2252,7 +2254,8 @@ async def shift_input_1_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def shift_input_2_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Two-step: ask user to paste Shift 2 report next."""
-    context.user_data["shift_summary_pending"] = 2
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    line_runtime(chat_id).shift_summary_pending = 2
     await update.message.reply_text(
         "✅ Shift set to 2.\n\n"
         "Now send your Shift 2 report in the next message (same format you normally paste).\n"
@@ -2270,6 +2273,8 @@ async def shift_summary_hourly_1_cmd(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     """Generate Shift 1 summary from hourly data"""
+    if not is_allowed_chat(update.effective_chat.id if update.effective_chat else None):
+        return
     await generate_shift_summary_from_hourly(update, context, 1)
 
 
@@ -2277,6 +2282,8 @@ async def shift_summary_hourly_2_cmd(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ):
     """Generate Shift 2 summary from hourly data"""
+    if not is_allowed_chat(update.effective_chat.id if update.effective_chat else None):
+        return
     await generate_shift_summary_from_hourly(update, context, 2)
 
 
@@ -2349,6 +2356,7 @@ async def generate_shift_summary_from_hourly(
     update: Update, context: ContextTypes.DEFAULT_TYPE, shift: int
 ):
     """Helper function to generate shift summary from hourly data"""
+    chat_id = update.effective_chat.id if update.effective_chat else None
     target_date = None
     if context.args:
         raw = context.args[0].strip()
@@ -2366,7 +2374,7 @@ async def generate_shift_summary_from_hourly(
             return
     else:
         # If no date specified, find the most recent date with hourly data for this shift
-        target_date = get_latest_hourly_date_for_shift(shift)
+        target_date = get_latest_hourly_date_for_shift(shift, chat_id)
         if not target_date:
             await update.message.reply_text(
                 f"⚠️ No hourly data found for Shift {shift} in the database.\n"
@@ -2375,7 +2383,7 @@ async def generate_shift_summary_from_hourly(
             return
 
     # Load shift data from hourly database
-    shift_text = load_shift_evidence_from_hourly_db(shift, target_date)
+    shift_text = load_shift_evidence_from_hourly_db(shift, target_date, chat_id)
     if not shift_text:
         date_str = target_date.strftime("%d/%m/%Y") if target_date else "unknown"
         await update.message.reply_text(
@@ -2391,21 +2399,22 @@ async def generate_shift_summary_from_hourly(
 
     try:
         # Temporarily use the hourly data for AI generation
-        original_evidence = ai_shift_evidence[shift].copy()
-        ai_shift_evidence[shift] = [shift_text]
+        rt_gen = line_runtime(chat_id)
+        original_evidence = rt_gen.evidence[shift].copy()
+        rt_gen.evidence[shift] = [shift_text]
 
         # Generate AI summary
-        ai_text = await ai_generate_summary(shift)
-        daily_ai_shift_summaries[shift] = ai_text
+        ai_text = await ai_generate_summary(shift, chat_id)
+        rt_gen.daily_summaries[shift] = ai_text
 
         # Post to group
         await split_and_send_long_message(
-            context.bot, GROUP_CHAT_ID,
+            context.bot, chat_id,
             f"📊 SHIFT {shift} SUMMARY (from hourly data - {date_str})\n\n{ai_text}",
         )
 
         # Restore original evidence
-        ai_shift_evidence[shift] = original_evidence
+        rt_gen.evidence[shift] = original_evidence
 
     except Exception as e:
         logger.error(f"Error generating shift summary from hourly data: {e}")
@@ -2414,15 +2423,15 @@ async def generate_shift_summary_from_hourly(
         )
 
 
-def get_latest_hourly_date_for_shift(shift: int):
+def get_latest_hourly_date_for_shift(shift: int, chat_id: int | None = None):
     """
     Find the most recent date that has hourly data for the specified shift.
     Returns date object or None if no data found.
     """
-    _ensure_hourly_production_table()
+    _ensure_hourly_production_table(chat_id)
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection(chat_id)
         cur = conn.cursor()
 
         # Find the most recent date with hourly data for this shift
@@ -2452,15 +2461,15 @@ def get_latest_hourly_date_for_shift(shift: int):
             conn.close()
 
 
-def get_latest_hourly_date_for_all_shifts():
+def get_latest_hourly_date_for_all_shifts(chat_id: int | None = None):
     """
     Find the most recent date that has hourly data for ANY shift.
     Returns date object or None if no data found.
     """
-    _ensure_hourly_production_table()
+    _ensure_hourly_production_table(chat_id)
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection(chat_id)
         cur = conn.cursor()
 
         # Find the most recent date with hourly data for any shift
@@ -2490,11 +2499,14 @@ def get_latest_hourly_date_for_all_shifts():
 async def generate_multi_shift_summary_and_post(
     context: ContextTypes.DEFAULT_TYPE,
     included_shifts: list[int],
+    chat_id: int | None = None,
 ) -> None:
     """
     Helper to call multi-shift AI and post into group.
     """
-    # Build label directly — never re-scan ai_shift_evidence for this
+    if chat_id is None:
+        chat_id = default_chat_id()
+    # Build label directly — never re-scan rt.evidence for this
     if len(included_shifts) == 1:
         label = f"Shift {included_shifts[0]}"
     elif len(included_shifts) == 2:
@@ -2502,32 +2514,32 @@ async def generate_multi_shift_summary_and_post(
     else:
         label = f"Shifts {', '.join(str(s) for s in included_shifts[:-1])} and {included_shifts[-1]}"
 
-    daily_text = await ai_generate_multi_shift_summary(included_shifts)
+    daily_text = await ai_generate_multi_shift_summary(included_shifts, chat_id)
     if not daily_text:
         await context.bot.send_message(
-            chat_id=GROUP_CHAT_ID,
+            chat_id=chat_id,
             text="⚠️ No complete multi-shift summary available. Please ensure all shifts have data for the same date.",
             parse_mode=None,
         )
         return
 
     await split_and_send_long_message(
-        context.bot, GROUP_CHAT_ID,
+        context.bot, chat_id,
         f"📘 MULTI-SHIFT PRODUCTION SUMMARY – {label}\n\n{daily_text}",
         parse_mode=None,
     )
 
 
 # ---------------- WEEKLY REPORT ----------------
-def aggregate_week_from_db(start_date, end_date) -> dict | None:
+def aggregate_week_from_db(start_date, end_date, chat_id: int | None = None) -> dict | None:
     """
     Aggregate production, downtime, rejects, and VOS over a date range (inclusive)
     from the hourly_production tables (hourly rows summed over the week).
     Returns a dict of weekly totals (per-hour pcs conversion applied),
     or None if no data exists in the range.
     """
-    _ensure_hourly_production_table()
-    conn = get_db_connection()
+    _ensure_hourly_production_table(chat_id)
+    conn = get_db_connection(chat_id)
     cur = conn.cursor()
     try:
         cur.execute(
@@ -2628,6 +2640,9 @@ async def weekly_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Generate a weekly production summary for the calendar week (Mon-Sun) of the
     given date. Defaults to the current week.
     """
+    if not is_allowed_chat(update.effective_chat.id if update.effective_chat else None):
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else None
     target_date = None
     if context.args:
         raw = context.args[0].strip()
@@ -2642,7 +2657,7 @@ async def weekly_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
 
     if target_date is None:
-        target_date = get_latest_hourly_date_for_all_shifts()
+        target_date = get_latest_hourly_date_for_all_shifts(chat_id=chat_id)
         if target_date is None:
             await update.message.reply_text(
                 "⚠️ No hourly data found in database. Submit some reports first."
@@ -2655,7 +2670,7 @@ async def weekly_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     start_label = week_start.strftime("%d/%m/%Y")
     end_label = week_end.strftime("%d/%m/%Y")
 
-    totals = aggregate_week_from_db(week_start, week_end)
+    totals = aggregate_week_from_db(week_start, week_end, chat_id=chat_id)
     if not totals:
         await update.message.reply_text(
             f"⚠️ No production data found for week {start_label} – {end_label}.\n"
@@ -2821,8 +2836,8 @@ Shrink               {reject_percentages["shrink"]:.1f} %           {rejects.get
 
     oee_performance = (
         f"📈 OVERALL EQUIPMENT EFFECTIVENESS\n\n"
-        f"  • Plan: {total_plan:,} pcs\n"
-        f"  • Actual: {total_actual:,} pcs\n"
+        f"  • Plan: {total_plan:,} packs\n"
+        f"  • Actual: {total_actual:,} packs\n"
         f"  • Defective Quantity: {defective_qty:,} pcs\n"
         f"  • Production Time: {production_hours:.2f} hr ({available_minutes} min)\n"
         f"  • Downtime: {downtime_hours:.2f} hr ({total_downtime} min)\n"
@@ -2851,7 +2866,7 @@ Shrink               {reject_percentages["shrink"]:.1f} %           {rejects.get
     )
 
     await split_and_send_long_message(
-        context.bot, GROUP_CHAT_ID, final_report.strip(), parse_mode=None
+        context.bot, chat_id, final_report.strip(), parse_mode=None
     )
 
 
@@ -3011,8 +3026,8 @@ def flatten_categorized_downtime(categorized: dict) -> list:
     return flat
 
 
-async def ai_generate_summary(shift: int):
-    evidence = ai_shift_evidence[shift]
+async def ai_generate_summary(shift: int, chat_id: int | None = None):
+    evidence = line_runtime(chat_id).evidence[shift]
     if not evidence:
         return "No evidence found."
 
@@ -3095,7 +3110,7 @@ async def ai_generate_summary(shift: int):
         if risk_score >= 3
         else "LOW"
     )
-    audit_status = "CLOSED" if shift_closed[shift] else "FOLLOW-UP REQUIRED"
+    audit_status = "CLOSED" if line_runtime(chat_id).shift_closed[shift] else "FOLLOW-UP REQUIRED"
 
     # ── Structured data for AI (UPDATED downtime section) ────────────────────
     structured_data = f"""
@@ -3212,8 +3227,8 @@ WRITING STYLE:
     production_performance_kpi = (
         f"📊 PRODUCTION PERFORMANCE\n\n"
         f"  • Product: {production_data['product_type']} Ltr\n"
-        f"  • Plan: {plan_output:,} pcs\n"
-        f"  • Actual: {actual_output:,} pcs\n"
+        f"  • Plan: {plan_output:,} packs\n"
+        f"  • Actual: {actual_output:,} packs\n"
         f"  • Achievement: {kpis['performance']:.1f}%"
     )
 
@@ -3232,8 +3247,8 @@ Shrink               {kpis["reject_percentages"]["shrink"]:.1f} %           {rej
 
     oee_performance = (
         f"📈 OVERALL EQUIPMENT EFFECTIVENESS\n\n"
-        f"  • Plan: {plan_output:,} pcs\n"
-        f"  • Actual: {actual_output:,} pcs\n"
+        f"  • Plan: {plan_output:,} packs\n"
+        f"  • Actual: {actual_output:,} packs\n"
         f"  • Defective Quantity: {kpis['defective_qty']:,} pcs\n"
         f"  • Production Time: {production_hours:.2f} hr ({int(production_hours * 60)} min)\n"
         f"  • Downtime: {kpis['downtime_hours']:.2f} hr ({int(kpis['downtime_hours'] * 60)} min)\n"
@@ -3448,8 +3463,8 @@ WRITING STYLE:
     production_performance_kpi = (
         f"📊 PRODUCTION PERFORMANCE\n\n"
         f"  • Product: {production_data['product_type']} Ltr\n"
-        f"  • Plan: {plan_output:,} pcs\n"
-        f"  • Actual: {actual_output:,} pcs\n"
+        f"  • Plan: {plan_output:,} packs\n"
+        f"  • Actual: {actual_output:,} packs\n"
         f"  • Achievement: {kpis['performance']:.1f}%"
     )
 
@@ -3468,8 +3483,8 @@ Shrink               {kpis["reject_percentages"]["shrink"]:.1f} %           {rej
 
     oee_performance = (
         f"📈 OVERALL EQUIPMENT EFFECTIVENESS\n\n"
-        f"  • Plan: {plan_output:,} pcs\n"
-        f"  • Actual: {actual_output:,} pcs\n"
+        f"  • Plan: {plan_output:,} packs\n"
+        f"  • Actual: {actual_output:,} packs\n"
         f"  • Defective Quantity: {kpis['defective_qty']:,} pcs\n"
         f"  • Production Time: {production_hours:.2f} hr ({int(production_hours * 60)} min)\n"
         f"  • Downtime: {kpis['downtime_hours']:.2f} hr ({int(kpis['downtime_hours'] * 60)} min)\n"
@@ -3500,14 +3515,17 @@ Shrink               {kpis["reject_percentages"]["shrink"]:.1f} %           {rej
     return final_report.strip()
 
 
-async def ai_generate_multi_shift_summary(included_shifts: list[int]):
+async def ai_generate_multi_shift_summary(
+    included_shifts: list[int], chat_id: int | None = None
+):
     if not included_shifts:
         return None
 
+    evidence = line_runtime(chat_id).evidence
     target_date = None
     for shift in included_shifts:
-        if ai_shift_evidence[shift]:
-            for text in reversed(ai_shift_evidence[shift]):
+        if evidence[shift]:
+            for text in reversed(evidence[shift]):
                 try:
                     production_data = parse_report(text)
                     if production_data and production_data.get("date"):
@@ -3540,7 +3558,7 @@ async def ai_generate_multi_shift_summary(included_shifts: list[int]):
     shifts_with_data = []
 
     for shift in (1, 2):
-        if not ai_shift_evidence[shift]:
+        if not evidence[shift]:
             continue
 
         shift_production_data = None
@@ -3548,7 +3566,7 @@ async def ai_generate_multi_shift_summary(included_shifts: list[int]):
         shift_rejects = {}
         shift_vos_info = None
 
-        for text in reversed(ai_shift_evidence[shift]):
+        for text in reversed(evidence[shift]):
             try:
                 production_data = parse_report(text)
                 if production_data and str(production_data.get("date")) == target_date:
@@ -3769,8 +3787,8 @@ WRITING STYLE:
     production_performance_kpi = (
         f"📊 PRODUCTION PERFORMANCE\n\n"
         f"  • Product: {product_type_str}\n"
-        f"  • Plan: {total_plan:,} pcs\n"
-        f"  • Actual: {total_actual:,} pcs\n"
+        f"  • Plan: {total_plan:,} packs\n"
+        f"  • Actual: {total_actual:,} packs\n"
         f"  • Achievement: {kpis['performance']:.1f}%"
     )
 
@@ -3789,8 +3807,8 @@ Shrink               {kpis["reject_percentages"]["shrink"]:.1f} %           {tot
 
     oee_performance = (
         f"📈 OVERALL EQUIPMENT EFFECTIVENESS\n\n"
-        f"  • Plan: {total_plan:,} pcs\n"
-        f"  • Actual: {total_actual:,} pcs\n"
+        f"  • Plan: {total_plan:,} packs\n"
+        f"  • Actual: {total_actual:,} packs\n"
         f"  • Defective Quantity: {kpis['defective_qty']:,} pcs\n"
         f"  • Production Time: {available_time_minutes} min\n"
         f"  • Downtime: {total_downtime} min\n"
@@ -4557,6 +4575,7 @@ async def validate_and_question_shift(
     context: ContextTypes.DEFAULT_TYPE,
     report_text: str,
     shift: int,
+    chat_id: int | None = None,
 ) -> dict | None:
     try:
         production_data = parse_report(report_text)
@@ -4596,7 +4615,7 @@ async def validate_and_question_shift(
         return validation
 
     session_key = f"shift_{shift}"
-    validation_sessions[session_key] = {
+    line_runtime(chat_id).validation_sessions[session_key] = {
         "state": VALIDATION_STATE_PENDING,
         "validation_result": validation,
         "report_text": report_text,
@@ -4628,7 +4647,7 @@ async def validate_and_question_shift(
     )
 
     try:
-        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=header)
+        await context.bot.send_message(chat_id=chat_id, text=header)
     except Exception as e:
         logger.error(f"Failed to send validation questions: {e}")
 
@@ -4642,9 +4661,9 @@ async def validate_and_question_hourly(
     report_text: str,
     shift: int,
     hour: int,
+    chat_id: int | None = None,
 ) -> dict | None:
-    global ai_reminder_block
-    ai_reminder_block = True  # Queue reminders while hourly validation runs
+    line_runtime(chat_id).ai_block = True  # Queue reminders while hourly validation runs
 
     try:
         production_data = parse_report(report_text)
@@ -4688,7 +4707,7 @@ async def validate_and_question_hourly(
         return validation
 
     session_key = f"hourly_{shift}_{hour}"
-    validation_sessions[session_key] = {
+    line_runtime(chat_id).validation_sessions[session_key] = {
         "state": VALIDATION_STATE_PENDING,
         "validation_result": validation,
         "report_text": report_text,
@@ -4719,7 +4738,7 @@ async def validate_and_question_hourly(
     )
 
     try:
-        await context.bot.send_message(chat_id=GROUP_CHAT_ID, text=header)
+        await context.bot.send_message(chat_id=chat_id, text=header)
     except Exception as e:
         logger.error(f"Failed to send validation questions: {e}")
 
@@ -4731,6 +4750,7 @@ async def validate_and_question_hourly(
 async def _release_summary_after_validation(
     context: ContextTypes.DEFAULT_TYPE,
     session: dict,
+    chat_id: int | None = None,
 ) -> None:
     """
     Called after validation is APPROVED or REJECTED.
@@ -4786,7 +4806,7 @@ async def _release_summary_after_validation(
         pending_shift = session.get("_pending_shift", shift)
 
         try:
-            ai_text = await ai_generate_summary(pending_shift)
+            ai_text = await ai_generate_summary(pending_shift, chat_id)
 
             if validation_notice:
                 insert_marker = (
@@ -4799,12 +4819,13 @@ async def _release_summary_after_validation(
                 else:
                     ai_text += validation_notice
 
-            daily_ai_shift_summaries[pending_shift] = ai_text
+            rt_rel = line_runtime(chat_id)
+            rt_rel.daily_summaries[pending_shift] = ai_text
             await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
+                chat_id=chat_id,
                 text=f"📊 SHIFT {pending_shift} OFFICIAL SUMMARY\n\n{ai_text}",
             )
-            shift_closed[pending_shift] = True
+            rt_rel.shift_closed[pending_shift] = True
         except Exception as e:
             logger.error(f"Error generating shift summary after validation: {e}")
 
@@ -4825,18 +4846,14 @@ async def _release_summary_after_validation(
                 else:
                     ai_summary += validation_notice
 
+            line_runtime(chat_id).ai_block = False
             await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
+                chat_id=chat_id,
                 text=f"📝 HOURLY AI SUMMARY ({hour_label})\n\n{ai_summary}",
             )
 
             # Flush queued reminders after hourly validation completes
-            try:
-                global ai_reminder_block
-                ai_reminder_block = False
-            except NameError:
-                pass
-            await flush_pending_reminders(context.bot, reason="ai")
+            await flush_pending_reminders(context.bot, reason="ai", chat_id=chat_id)
         except Exception as e:
             logger.error(f"Error generating hourly summary after validation: {e}")
 
@@ -4844,20 +4861,22 @@ async def _release_summary_after_validation(
     session_key = f"{report_type}_{session['shift']}"
     if report_type == "hourly":
         session_key = f"hourly_{session['shift']}_{session.get('hour', 0)}"
-    validation_sessions.pop(session_key, None)
+    line_runtime(chat_id).validation_sessions.pop(session_key, None)
 
 
 async def all_shift_summary_handler(client, message):
     try:
+        chat_id = getattr(message.chat, "id", None)
+        rt = line_runtime(chat_id)
         # Get today's date
         today = datetime.now().date()
 
         # Find all shifts with data for today
         available_shifts = []
         for shift in (1, 2):
-            if ai_shift_evidence[shift]:
+            if rt.evidence[shift]:
                 # Check if there's data for today
-                for text in reversed(ai_shift_evidence[shift]):
+                for text in reversed(rt.evidence[shift]):
                     try:
                         production_data = parse_report(text)
                         if production_data and str(
@@ -4873,7 +4892,7 @@ async def all_shift_summary_handler(client, message):
             return
 
         # Generate multi-shift summary using your existing function
-        multi_shift_summary = await ai_generate_multi_shift_summary(available_shifts)
+        multi_shift_summary = await ai_generate_multi_shift_summary(available_shifts, chat_id)
 
         if not multi_shift_summary:
             await message.reply("❌ Unable to generate multi-shift summary.")
@@ -4915,16 +4934,19 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if update.effective_user.is_bot:
         return
 
-    user_id = update.effective_user.id
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if not is_allowed_chat(chat_id):
+        return
+    rt_hm = line_runtime(chat_id)
     text = update.message.text.strip()
 
     # ═══════════════════════════════════════════════════════════════════
     # PRIORITY 1: Check if there's an active validation session waiting
-    # for an operator answer. This takes priority over everything.
+    # for an operator answer. This may take priority over everything.
     # ═══════════════════════════════════════════════════════════════════
-    active_validation_key = context.user_data.get("active_validation_session")
+    active_validation_key = rt_hm.active_validation_key
     if active_validation_key and not text.startswith("/"):
-        session = validation_sessions.get(active_validation_key)
+        session = rt_hm.validation_sessions.get(active_validation_key)
         if session and session["state"] in (
             VALIDATION_STATE_PENDING,
             VALIDATION_STATE_FOLLOWUP,
@@ -4940,7 +4962,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # AI evaluates the answer
             await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID, text="🔍 Evaluating your explanation..."
+                chat_id=chat_id, text="🔍 Evaluating your explanation..."
             )
 
             eval_result = await evaluate_operator_answer(
@@ -4967,7 +4989,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 session["verdict_reasoning"] = reasoning
 
                 await context.bot.send_message(
-                    chat_id=GROUP_CHAT_ID,
+                    chat_id=chat_id,
                     text=(
                         f"✅ VALIDATION APPROVED\n\n"
                         f"{reasoning}\n\n"
@@ -4976,10 +4998,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 )
 
                 # Clear the active session
-                context.user_data.pop("active_validation_session", None)
+                rt_hm.active_validation_key = None
 
                 # Now generate and post the summary
-                await _release_summary_after_validation(context, session)
+                await _release_summary_after_validation(context, session, chat_id)
                 return
 
             elif verdict == "FOLLOW_UP":
@@ -4998,7 +5020,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
                 remaining = MAX_VALIDATION_ROUNDS - session["rounds"]
                 await context.bot.send_message(
-                    chat_id=GROUP_CHAT_ID,
+                    chat_id=chat_id,
                     text=(
                         f"🔄 FOLLOW-UP REQUIRED\n\n"
                         f"{reasoning}\n\n"
@@ -5018,7 +5040,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 gap_min = session["validation_result"]["gap_minutes"]
 
                 await context.bot.send_message(
-                    chat_id=GROUP_CHAT_ID,
+                    chat_id=chat_id,
                     text=(
                         f"❌ VALIDATION REJECTED — UNACCOUNTED PRODUCTION LOSS\n\n"
                         f"{reasoning}\n\n"
@@ -5028,25 +5050,25 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     ),
                 )
 
-                context.user_data.pop("active_validation_session", None)
+                rt_hm.active_validation_key = None
 
                 # Generate summary WITH the rejection notice
-                await _release_summary_after_validation(context, session)
+                await _release_summary_after_validation(context, session, chat_id)
                 return
 
         else:
             # Session expired or invalid — clean up
-            context.user_data.pop("active_validation_session", None)
+            rt_hm.active_validation_key = None
 
     # ═══════════════════════════════════════════════════════════════════
     # PRIORITY 2: Shift summary two-step
     # ═══════════════════════════════════════════════════════════════════
-    pending_shift = context.user_data.get("shift_summary_pending")
+    pending_shift = rt_hm.shift_summary_pending
     if pending_shift is not None and text and not text.startswith("/"):
-        context.user_data.pop("shift_summary_pending", None)
+        rt_hm.shift_summary_pending = None
         try:
-            ai_shift_evidence[pending_shift].append(text)
-            shift_closed[pending_shift] = False
+            rt_hm.evidence[pending_shift].append(text)
+            rt_hm.shift_closed[pending_shift] = False
 
             # Save to DB
             try:
@@ -5061,31 +5083,35 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     rejects,
                     vos_info=vos_info,
                     shift_override=pending_shift,
+                    chat_id=chat_id,
                 )
             except Exception as e:
                 logger.warning(f"Manual shift input DB save skipped: {e}")
 
             # Validate production — may BLOCK summary
-            validation = await validate_and_question_shift(context, text, pending_shift)
+            validation = await validate_and_question_shift(
+                context, text, pending_shift, chat_id
+            )
             await asyncio.sleep(1)
 
             if validation and validation.get("_blocked"):
                 # Summary is BLOCKED — store context for when validation completes
                 session_key = validation["_session_key"]
-                context.user_data["active_validation_session"] = session_key
+                rt_hm.active_validation_key = session_key
                 # Store the report text in session for later summary generation
-                validation_sessions[session_key]["_pending_shift"] = pending_shift
-                validation_sessions[session_key]["_report_text"] = text
+                rt_va = rt_hm.validation_sessions
+                rt_va[session_key]["_pending_shift"] = pending_shift
+                rt_va[session_key]["_report_text"] = text
                 return
             else:
                 # No gap or valid production — generate summary immediately
-                ai_text = await ai_generate_summary(pending_shift)
-                daily_ai_shift_summaries[pending_shift] = ai_text
+                ai_text = await ai_generate_summary(pending_shift, chat_id)
+                rt_hm.daily_summaries[pending_shift] = ai_text
                 await context.bot.send_message(
-                    chat_id=GROUP_CHAT_ID,
+                    chat_id=chat_id,
                     text=f"📊 SHIFT {pending_shift} OFFICIAL SUMMARY\n\n{ai_text}",
                 )
-                shift_closed[pending_shift] = True
+                rt_hm.shift_closed[pending_shift] = True
         except Exception as e:
             logger.error(f"Error generating shift summary (manual): {e}")
             await update.message.reply_text(f"❌ Error generating shift summary: {e}")
@@ -5094,11 +5120,11 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # ═══════════════════════════════════════════════════════════════════
     # PRIORITY 3: Hourly summary two-step
     # ═══════════════════════════════════════════════════════════════════
-    pending_hour = context.user_data.get("hourly_summary_pending")
+    pending_hour = rt_hm.hourly_summary_pending
     if pending_hour and text and not text.startswith("/"):
-        context.user_data.pop("hourly_summary_pending", None)
+        rt_hm.hourly_summary_pending = False
         try:
-            # Parse shift and hour from input data
+            # Parse shift and hour from the report data
             production_data = parse_report(text)
             current_shift_num = production_data["shift"]
 
@@ -5126,6 +5152,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     hour_number=hour_slot,
                     vos_info=vos_info,
                     shift_override=current_shift_num,
+                    chat_id=chat_id,
                 )
                 logger.info(
                     f"Hourly data saved: shift={current_shift_num}, hour={hour_slot}"
@@ -5135,126 +5162,48 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             # Validate production — may BLOCK summary
             validation = await validate_and_question_hourly(
-                context, text, current_shift_num, hour_slot
+                context, text, current_shift_num, hour_slot, chat_id
             )
             await asyncio.sleep(1)
 
             if validation and validation.get("_blocked"):
                 session_key = validation["_session_key"]
-                context.user_data["active_validation_session"] = session_key
-                validation_sessions[session_key]["_pending_hour"] = hour_slot
-                validation_sessions[session_key]["_report_text"] = text
-                validation_sessions[session_key]["_hour_label"] = hour_label
+                rt_hm.active_validation_key = session_key
+                rt_va = rt_hm.validation_sessions
+                rt_va[session_key]["_pending_hour"] = hour_slot
+                rt_va[session_key]["_report_text"] = text
+                rt_va[session_key]["_hour_label"] = hour_label
                 return
             else:
                 ai_summary = await ai_generate_hourly_summary_from_text(text)
                 await context.bot.send_message(
-                    chat_id=GROUP_CHAT_ID,
+                    chat_id=chat_id,
                     text=f"📝 HOURLY AI SUMMARY ({hour_label})\n\n{ai_summary}",
                 )
                 # Flush queued reminders after hourly summary completes
-                try:
-                    global ai_reminder_block
-                    ai_reminder_block = False
-                except NameError:
-                    pass
-                await flush_pending_reminders(context.bot, reason="ai")
+                rt_hm.ai_block = False
+                await flush_pending_reminders(context.bot, reason="ai", chat_id=chat_id)
         except Exception as e:
             logger.error(f"Error generating hourly summary: {e}")
             await update.message.reply_text(f"❌ Error: {e}")
         return
-    # ═══════════════════════════════════════════════════════════════════
-    # PRIORITY 4: AI Audit mode (existing behavior)
-    # ═══════════════════════════════════════════════════════════════════
-    if user_id not in active_users:
-        return
-
-    if not text.startswith("/"):
-        target_shift = None
-        try:
-            parsed = parse_report(text)
-            target_shift = parsed.get("shift")
-        except Exception:
-            target_shift = None
-        if target_shift not in (1, 2):
-            target_shift = current_shift
-        if not shift_closed[target_shift]:
-            ai_shift_evidence[target_shift].append(text)
-        if target_shift in (1, 2):
-            try:
-                production_data = parse_report(text)
-                categorized_dt = parse_downtime_categorized(text)
-                downtime = flatten_categorized_downtime(categorized_dt)
-                rejects = parse_rejects(text)
-                vos_info = parse_vos(text)
-                save_to_database(
-                    production_data,
-                    downtime,
-                    rejects,
-                    vos_info=vos_info,
-                    shift_override=target_shift,
-                )
-                logger.info(f"Shift {target_shift} report saved to database (AI audit)")
-            except Exception as e:
-                logger.warning(f"AI audit DB save skipped: {e}")
-
-    try:
-        next_ai_question = await generate_ai_questions_for_message(user_id, text)
-
-        if not next_ai_question:
-            return
-
-        if next_ai_question == "STOP":
-            await context.bot.send_message(
-                GROUP_CHAT_ID,
-                "✅ Audit completed.\nAll observed issues have been addressed or scheduled.\nNo further AI questions.",
-            )
-            active_users.discard(user_id)
-            user_ai_sessions.pop(user_id, None)
-            user_audit_state.pop(user_id, None)
-            if "ai_reminder_block" in dir():
-                ai_reminder_block = False
-            await flush_pending_reminders(context.bot, reason="ai")
-            return
-
-        msg = f"❓ AI Question:\n{next_ai_question}"
-        await context.bot.send_message(GROUP_CHAT_ID, msg)
-        user_audit_state[user_id]["questions"] += 1
-
-    except Exception as e:
-        logger.error(f"Error processing message: {e}")
-        await update.message.reply_text("Error processing message. Please try again.")
-
-
 # ---------------- SCHEDULER ----------------
-async def scheduled_audit(app, chat_id, message_text, delay_seconds):
-    await asyncio.sleep(delay_seconds)
-    # Anonymous trigger
-    user_id = 0  # Dummy user for scheduler
-    user_ai_sessions[user_id] = [{"role": "system", "content": AI_SYSTEM_PROMPT}]
-    question = await generate_ai_questions_for_message(user_id, message_text)
-    if question:
-        await app.bot.send_message(
-            chat_id,
-            f"📅 Scheduled Audit:\n❓ AI Question:\n{question}\n\n🛠 Operator answer:\n{message_text}",
-        )
-
-
 async def remind_shift_plan(context: ContextTypes.DEFAULT_TYPE):
-    global shift_plan_sent_today
+    chat_id = (context.job.data or {}).get("chat_id")
+    rt_rsp = line_runtime(chat_id)
     shift = context.job.data["shift"]
     now = now_ethiopia()
     today = now.date()
     today_iso = today.isoformat()
 
     key = f"shift_plan_fired_{today_iso}_{shift}"
-    if bot_state_get(key):
+    if bot_state_get(key, chat_id):
         logger.info(f"Shift {shift} plan already fired today, skipping")
         return
 
-    if line_state != LINE_STATE_RUNNING:
+    if rt_rsp.line_state != LINE_STATE_RUNNING:
         logger.info(
-            f"Shift {shift} plan suppressed (line={line_state}) "
+            f"Shift {shift} plan suppressed (line={rt_rsp.line_state}) "
             f"— key NOT written, catchup will resend on line_on"
         )
         return
@@ -5267,10 +5216,12 @@ async def remind_shift_plan(context: ContextTypes.DEFAULT_TYPE):
         + "- Shift plan (packs)\n"
         + "- Expected manpower / constraints"
     )
-    result = await send_or_queue_reminder(context, text, parse_mode="Markdown")
+    result = await send_or_queue_reminder(
+        context, text, parse_mode="Markdown", chat_id=chat_id
+    )
     if result in ("sent", "queued"):
-        bot_state_set(key, "1")
-        shift_plan_sent_today[shift] = today
+        bot_state_set(key, "1", chat_id)
+        rt_rsp.plan_sent_today[shift] = today
         logger.info(f"Shift {shift} plan reminder fired by scheduler at :02")
     else:
         logger.warning(
@@ -5279,6 +5230,7 @@ async def remind_shift_plan(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def remind_shift_report(context: ContextTypes.DEFAULT_TYPE):
+    chat_id = (context.job.data or {}).get("chat_id")
     shift = context.job.data["shift"]
     now = now_ethiopia()
     if not is_in_shift_summary_window(shift, now):
@@ -5289,13 +5241,13 @@ async def remind_shift_report(context: ContextTypes.DEFAULT_TYPE):
 
     today_iso = now.date().isoformat()
     key = f"shift_report_fired_{today_iso}_{shift}"
-    if bot_state_get(key):
+    if bot_state_get(key, chat_id):
         logger.info(f"Shift {shift} report already fired today, skipping")
         return
 
-    if not _shift_had_any_production(shift, today_iso):
+    if not _shift_had_any_production(shift, today_iso, chat_id):
         logger.info(f"Shift {shift} had no production, skipping summary reminder")
-        bot_state_set(key, "1")
+        bot_state_set(key, "1", chat_id)
         return
 
     header = f"📅 {format_date_time_12h(now)}\n\n"
@@ -5307,11 +5259,13 @@ async def remind_shift_report(context: ContextTypes.DEFAULT_TYPE):
         + "- What should the next shift be aware of?\n"
         + "- Status: All clear / Needs attention"
     )
-    result = await send_or_queue_reminder(context, text, parse_mode="Markdown")
+    result = await send_or_queue_reminder(
+        context, text, parse_mode="Markdown", chat_id=chat_id
+    )
 
     # Write key ONLY if actually sent or queued (not failed)
     if result in ("sent", "queued"):
-        bot_state_set(key, "1")
+        bot_state_set(key, "1", chat_id)
         logger.info(f"Shift {shift} report reminder fired by scheduler at :55")
     else:
         logger.warning(
@@ -5322,6 +5276,8 @@ async def remind_shift_report(context: ContextTypes.DEFAULT_TYPE):
 async def remind_hourly_plan(context: ContextTypes.DEFAULT_TYPE):
     now = now_ethiopia()
     job_data = context.job.data or {}
+    chat_id = job_data.get("chat_id")
+    rt_rhp = line_runtime(chat_id)
 
     shift = job_data.get("shift") or get_shift_for_time(now)
     hour = job_data.get("hour") or get_current_hour_number(shift, now)
@@ -5336,14 +5292,14 @@ async def remind_hourly_plan(context: ContextTypes.DEFAULT_TYPE):
     sched_key = f"hourly_plan_scheduled_{today_iso}_{shift}_{hour}"
     catch_key = f"hourly_plan_{today_iso}_{shift}_{hour}"
 
-    if bot_state_get(catch_key):
+    if bot_state_get(catch_key, chat_id):
         logger.info(f"Hourly plan Shift {shift} Hour {hour} already sent, skipping")
         return
 
     # Line inactive — do NOT write DB key so catchup on line_on can resend
-    if line_state != LINE_STATE_RUNNING:
+    if rt_rhp.line_state != LINE_STATE_RUNNING:
         logger.info(
-            f"Hourly plan Shift {shift} Hour {hour} suppressed (line={line_state}) "
+            f"Hourly plan Shift {shift} Hour {hour} suppressed (line={rt_rhp.line_state}) "
             f"— key NOT written, catchup will resend on line_on"
         )
         return
@@ -5360,17 +5316,19 @@ async def remind_hourly_plan(context: ContextTypes.DEFAULT_TYPE):
 
     # ✅ Capture result
     meta = {"kind": "hourly_plan", "shift": shift, "hour": hour}
-    success = await send_or_queue_reminder(context, text, parse_mode="Markdown", meta=meta)
+    success = await send_or_queue_reminder(
+        context, text, parse_mode="Markdown", meta=meta, chat_id=chat_id
+    )
 
     # ✅ Write DB ONLY if message actually sent
     if success in ("sent", "queued"):
-        bot_state_set(sched_key, "1")
-        bot_state_set(catch_key, "1")
+        bot_state_set(sched_key, "1", chat_id)
+        bot_state_set(catch_key, "1", chat_id)
         logger.info(f"Hourly plan confirmed sent: Shift {shift} Hour {hour}")
         # New hour started → remove the previous hour's plan + summary reminders
         if success == "sent":
             prev_shift, prev_hour = _previous_frame(shift, hour)
-            await delete_reminder_frame(context.bot, prev_shift, prev_hour)
+            await delete_reminder_frame(context.bot, prev_shift, prev_hour, chat_id)
     else:
         logger.warning(
             f"Hourly plan NOT marked sent (delivery failed): Shift {shift} Hour {hour}"
@@ -5380,6 +5338,7 @@ async def remind_hourly_plan(context: ContextTypes.DEFAULT_TYPE):
 async def remind_hourly_summary(context: ContextTypes.DEFAULT_TYPE):
     now = now_ethiopia()
     job_data = context.job.data or {}
+    chat_id = job_data.get("chat_id")
     shift = job_data.get("shift") or get_shift_for_time(now)
     hour = job_data.get("hour") or get_current_hour_number(shift, now)
 
@@ -5391,17 +5350,17 @@ async def remind_hourly_summary(context: ContextTypes.DEFAULT_TYPE):
     sched_key = f"hourly_summary_scheduled_{today_iso}_{shift}_{hour}"
     catch_key = f"hourly_summary_{today_iso}_{shift}_{hour}"
 
-    if bot_state_get(sched_key):
+    if bot_state_get(sched_key, chat_id):
         logger.info(f"Hourly summary Shift {shift} Hour {hour} already sent, skipping")
         return
 
     # No production this hour — mark and skip
-    if not _hour_had_production_or_partial(shift, hour, today_iso):
+    if not _hour_had_production_or_partial(shift, hour, today_iso, chat_id):
         logger.info(
             f"Hourly summary Shift {shift} Hour {hour} — no production, skipping"
         )
-        bot_state_set(sched_key, "1")
-        bot_state_set(catch_key, "1")
+        bot_state_set(sched_key, "1", chat_id)
+        bot_state_set(catch_key, "1", chat_id)
         return
 
     header = f"📅 {format_date_time_12h(now)}\n\n"
@@ -5420,12 +5379,13 @@ async def remind_hourly_summary(context: ContextTypes.DEFAULT_TYPE):
         text,
         parse_mode="Markdown",
         meta={"kind": "hourly_summary", "shift": shift, "hour": hour},
+        chat_id=chat_id,
     )
 
     # ✅ Only write DB keys if actually sent or queued (not failed)
     if result in ("sent", "queued"):
-        bot_state_set(sched_key, "1")
-        bot_state_set(catch_key, "1")
+        bot_state_set(sched_key, "1", chat_id)
+        bot_state_set(catch_key, "1", chat_id)
         logger.info(f"Hourly summary fired: Shift {shift} Hour {hour}")
     else:
         logger.warning(
@@ -5434,19 +5394,20 @@ async def remind_hourly_summary(context: ContextTypes.DEFAULT_TYPE):
 
 
 async def remind_daily_production_plan(context: ContextTypes.DEFAULT_TYPE):
-    global daily_plan_last_date
+    chat_id = (context.job.data or {}).get("chat_id")
+    rt_rdp = line_runtime(chat_id)
     now = now_ethiopia()
     today = now.date()
     today_iso = today.isoformat()
 
     key = f"daily_plan_{today_iso}"
-    if bot_state_get(key):
+    if bot_state_get(key, chat_id):
         logger.info("Daily plan already sent today (scheduled job), skipping")
         return
 
-    if line_state != LINE_STATE_RUNNING:
+    if rt_rdp.line_state != LINE_STATE_RUNNING:
         logger.info(
-            f"Daily plan suppressed (line={line_state}) "
+            f"Daily plan suppressed (line={rt_rdp.line_state}) "
             f"— key NOT written, catchup will resend on line_on"
         )
         return
@@ -5460,11 +5421,13 @@ async def remind_daily_production_plan(context: ContextTypes.DEFAULT_TYPE):
         + "- Target packs per shift\n"
         + "- Any known constraints (utilities, materials, manpower)."
     )
-    result = await send_or_queue_reminder(context, text, parse_mode="Markdown")
+    result = await send_or_queue_reminder(
+        context, text, parse_mode="Markdown", chat_id=chat_id
+    )
     if result in ("sent", "queued"):
-        bot_state_set(key, "1")
-        daily_plan_last_date = today
-        bot_state_set("daily_plan_last_date", today_iso)
+        bot_state_set(key, "1", chat_id)
+        rt_rdp.last_plan_date = today
+        bot_state_set("daily_plan_last_date", today_iso, chat_id)
         logger.info("Daily plan reminder fired by scheduler")
     else:
         logger.warning(
@@ -5482,161 +5445,138 @@ async def setup_shift_schedules(app):
 
     logger.info("Setting up shift schedules and reminders...")
 
-    # ── DAILY PLAN ──────────────────────────────────────────────────────────
-    # Ethiopian 01:00 → PC 07:00 (primary, Shift 1 start)
-    job_queue.run_daily(
-        remind_daily_production_plan,
-        time=ethiopian_clock_time_to_pc_time(time(1, 0)),
-        name="daily_plan_shift1",
-    )
-    # Fallback for Shift 2 (once-per-day guard inside the function)
-    job_queue.run_daily(
-        remind_daily_production_plan,
-        time=ethiopian_clock_time_to_pc_time(time(13, 0)),
-        name="daily_plan_shift2",
-    )
+    lines = configured_lines() or ["1ltr"]
 
-    # ════════════════════════════════════════════════════════════════════════
-    # SHIFT 1 │ Ethiopian 01:00–13:00 │ PC 07:00–19:00
-    # 1:02 Shift Plan, 1:05 Hr1 Plan,  1:55 Hr1 Summary
-    # 2:02 Hr2 Plan,   2:55 Hr2 Summary
-    # 3:02 Hr3 Plan,   3:55 Hr3 Summary
-    # 4:02 Hr4 Plan,   4:55 Hr4 Summary
-    # 5:02 Hr5 Plan,   5:55 Hr5 Summary
-    # 6:02 Hr6 Plan,   6:55 Hr6 Summary
-    # 7:02 Hr7 Plan,   7:55 Hr7 Summary
-    # 8:02 Hr8 Plan,   8:55 Hr8 Summary
-    # 9:02 Hr9 Plan,   9:55 Hr9 Summary
-    # 10:02 Hr10 Plan, 10:55 Hr10 Summary
-    # 11:02 Hr11 Plan, 11:55 Hr11 Summary
-    # 12:02 Hr12 Plan, 12:50 Hr12 Summary, 12:55 Shift Summary
-    # ════════════════════════════════════════════════════════════════════════
-    job_queue.run_daily(
-        remind_shift_plan,
-        time=ethiopian_clock_time_to_pc_time(time(1, 2)),
-        data={"shift": 1},
-        name="shift1_plan",
-    )
+    # ── Schedule every reminder for EVERY configured line ─────────────────
+    for line_key in lines:
+        chat_id = chat_id_for_line(line_key)
 
-    for hour in range(1, 12):
+        # ── DAILY PLAN ──────────────────────────────────────────────────────
+        # Ethiopian 01:00 → PC 07:00 (primary, Shift 1 start)
+        job_queue.run_daily(
+            remind_daily_production_plan,
+            time=ethiopian_clock_time_to_pc_time(time(1, 0)),
+            data={"chat_id": chat_id},
+            name=f"daily_plan_shift1_{line_key}",
+        )
+        # Fallback for Shift 2 (once-per-day guard inside the function)
+        job_queue.run_daily(
+            remind_daily_production_plan,
+            time=ethiopian_clock_time_to_pc_time(time(13, 0)),
+            data={"chat_id": chat_id},
+            name=f"daily_plan_shift2_{line_key}",
+        )
+
+        # ═══ SHIFT 1 │ Ethiopian 01:00–13:00 │ PC 07:00–19:00 ═══
+        job_queue.run_daily(
+            remind_shift_plan,
+            time=ethiopian_clock_time_to_pc_time(time(1, 2)),
+            data={"shift": 1, "chat_id": chat_id},
+            name=f"shift1_plan_{line_key}",
+        )
+
+        for hour in range(1, 12):
+            job_queue.run_daily(
+                remind_hourly_plan,
+                time=ethiopian_clock_time_to_pc_time(time(hour, 2)),
+                data={"shift": 1, "hour": hour, "chat_id": chat_id},
+                name=f"shift1_hour{hour}_plan_{line_key}",
+            )
+            job_queue.run_daily(
+                remind_hourly_summary,
+                time=ethiopian_clock_time_to_pc_time(time(hour, 55)),
+                data={"shift": 1, "hour": hour, "chat_id": chat_id},
+                name=f"shift1_hour{hour}_summary_{line_key}",
+            )
+
+        # Last hour (Hour 12): Plan at :02, Summary at :50, Shift Summary at :55
         job_queue.run_daily(
             remind_hourly_plan,
-            time=ethiopian_clock_time_to_pc_time(time(hour, 2)),
-            data={"shift": 1, "hour": hour},
-            name=f"shift1_hour{hour}_plan",
+            time=ethiopian_clock_time_to_pc_time(time(12, 2)),
+            data={"shift": 1, "hour": 12, "chat_id": chat_id},
+            name=f"shift1_hour12_plan_{line_key}",
         )
         job_queue.run_daily(
             remind_hourly_summary,
-            time=ethiopian_clock_time_to_pc_time(time(hour, 55)),
-            data={"shift": 1, "hour": hour},
-            name=f"shift1_hour{hour}_summary",
+            time=ethiopian_clock_time_to_pc_time(time(12, 50)),
+            data={"shift": 1, "hour": 12, "chat_id": chat_id},
+            name=f"shift1_hour12_summary_{line_key}",
+        )
+        job_queue.run_daily(
+            remind_shift_report,
+            time=ethiopian_clock_time_to_pc_time(time(12, 55)),
+            data={"shift": 1, "chat_id": chat_id},
+            name=f"shift1_report_{line_key}",
         )
 
-    # Last hour (Hour 12): Plan at :02, Summary at :50, Shift Summary at :55
-    job_queue.run_daily(
-        remind_hourly_plan,
-        time=ethiopian_clock_time_to_pc_time(time(12, 2)),
-        data={"shift": 1, "hour": 12},
-        name="shift1_hour12_plan",
-    )
-    job_queue.run_daily(
-        remind_hourly_summary,
-        time=ethiopian_clock_time_to_pc_time(time(12, 50)),
-        data={"shift": 1, "hour": 12},
-        name="shift1_hour12_summary",
-    )
-    job_queue.run_daily(
-        remind_shift_report,
-        time=ethiopian_clock_time_to_pc_time(time(12, 55)),
-        data={"shift": 1},
-        name="shift1_report",
-    )
+        # ═══ SHIFT 2 │ Ethiopian 13:00–01:00 │ PC 19:00–07:00 ═══
+        job_queue.run_daily(
+            remind_shift_plan,
+            time=ethiopian_clock_time_to_pc_time(time(13, 2)),
+            data={"shift": 2, "chat_id": chat_id},
+            name=f"shift2_plan_{line_key}",
+        )
 
-    logger.info("Shift 1 schedule registered")
+        # Hours 1-5: Ethiopian 13-17 (afternoon/evening before midnight)
+        for hour in range(13, 18):
+            eth_hour = hour - 12  # display hour 1-5
+            job_queue.run_daily(
+                remind_hourly_plan,
+                time=ethiopian_clock_time_to_pc_time(time(hour, 2)),
+                data={"shift": 2, "hour": eth_hour, "chat_id": chat_id},
+                name=f"shift2_hour{eth_hour}_plan_{line_key}",
+            )
+            job_queue.run_daily(
+                remind_hourly_summary,
+                time=ethiopian_clock_time_to_pc_time(time(hour, 55)),
+                data={"shift": 2, "hour": eth_hour, "chat_id": chat_id},
+                name=f"shift2_hour{eth_hour}_summary_{line_key}",
+            )
 
-    # ════════════════════════════════════════════════════════════════════════
-    # SHIFT 2 │ Ethiopian 13:00–01:00 │ PC 19:00–07:00
-    # 13:02 Shift Plan, 13:05 Hr1 Plan, 13:55 Hr1 Summary
-    # 14:02 Hr2 Plan,   14:55 Hr2 Summary
-    # 15:02 Hr3 Plan,   15:55 Hr3 Summary
-    # 16:02 Hr4 Plan,   16:55 Hr4 Summary
-    # 17:02 Hr5 Plan,   17:55 Hr5 Summary
-    # 18:02 Hr6 Plan,   18:55 Hr6 Summary
-    # 19:02 Hr7 Plan,   19:55 Hr7 Summary
-    # 20:02 Hr8 Plan,   20:55 Hr8 Summary
-    # 21:02 Hr9 Plan,   21:55 Hr9 Summary
-    # 22:02 Hr10 Plan,  22:55 Hr10 Summary
-    # 23:02 Hr11 Plan,  23:55 Hr11 Summary
-    # 0:02 Hr12 Plan,   0:50 Hr12 Summary, 0:55 Shift Summary
-    # ════════════════════════════════════════════════════════════════════════
-    job_queue.run_daily(
-        remind_shift_plan,
-        time=ethiopian_clock_time_to_pc_time(time(13, 2)),
-        data={"shift": 2},
-        name="shift2_plan",
-    )
+        # Hours 6-11: Ethiopian 18-23 (evening/overnight)
+        for hour in range(18, 24):
+            eth_hour = hour - 12  # display hour 6-11
+            job_queue.run_daily(
+                remind_hourly_plan,
+                time=ethiopian_clock_time_to_pc_time(time(hour, 2)),
+                data={"shift": 2, "hour": eth_hour, "chat_id": chat_id},
+                name=f"shift2_hour{eth_hour}_plan_{line_key}",
+            )
+            job_queue.run_daily(
+                remind_hourly_summary,
+                time=ethiopian_clock_time_to_pc_time(time(hour, 55)),
+                data={"shift": 2, "hour": eth_hour, "chat_id": chat_id},
+                name=f"shift2_hour{eth_hour}_summary_{line_key}",
+            )
 
-    # Hours 1-5: Ethiopian 13-17 (afternoon/evening before midnight)
-    for hour in range(13, 18):
-        eth_hour = hour - 12  # display hour 1-5
+        # Last hour (Hour 12): Ethiopian 0:00 (midnight) → PC 06:00
         job_queue.run_daily(
             remind_hourly_plan,
-            time=ethiopian_clock_time_to_pc_time(time(hour, 2)),
-            data={"shift": 2, "hour": eth_hour},
-            name=f"shift2_hour{eth_hour}_plan",
+            time=ethiopian_clock_time_to_pc_time(time(0, 2)),
+            data={"shift": 2, "hour": 12, "chat_id": chat_id},
+            name=f"shift2_hour12_plan_{line_key}",
         )
         job_queue.run_daily(
             remind_hourly_summary,
-            time=ethiopian_clock_time_to_pc_time(time(hour, 55)),
-            data={"shift": 2, "hour": eth_hour},
-            name=f"shift2_hour{eth_hour}_summary",
-        )
-
-    # Hours 6-11: Ethiopian 18-23 (evening/overnight)
-    for hour in range(18, 24):
-        eth_hour = hour - 12  # display hour 6-11
-        job_queue.run_daily(
-            remind_hourly_plan,
-            time=ethiopian_clock_time_to_pc_time(time(hour, 2)),
-            data={"shift": 2, "hour": eth_hour},
-            name=f"shift2_hour{eth_hour}_plan",
+            time=ethiopian_clock_time_to_pc_time(time(0, 50)),
+            data={"shift": 2, "hour": 12, "chat_id": chat_id},
+            name=f"shift2_hour12_summary_{line_key}",
         )
         job_queue.run_daily(
-            remind_hourly_summary,
-            time=ethiopian_clock_time_to_pc_time(time(hour, 55)),
-            data={"shift": 2, "hour": eth_hour},
-            name=f"shift2_hour{eth_hour}_summary",
+            remind_shift_report,
+            time=ethiopian_clock_time_to_pc_time(time(0, 55)),
+            data={"shift": 2, "chat_id": chat_id},
+            name=f"shift2_report_{line_key}",
         )
 
-    # Last hour (Hour 12): Ethiopian 0:00 (midnight) → PC 06:00
-    job_queue.run_daily(
-        remind_hourly_plan,
-        time=ethiopian_clock_time_to_pc_time(time(0, 2)),
-        data={"shift": 2, "hour": 12},
-        name="shift2_hour12_plan",
-    )
-    job_queue.run_daily(
-        remind_hourly_summary,
-        time=ethiopian_clock_time_to_pc_time(time(0, 50)),
-        data={"shift": 2, "hour": 12},
-        name="shift2_hour12_summary",
-    )
-    job_queue.run_daily(
-        remind_shift_report,
-        time=ethiopian_clock_time_to_pc_time(time(0, 55)),
-        data={"shift": 2},
-        name="shift2_report",
-    )
+        logger.info(f"Reminder schedule registered for line {line_key} (chat {chat_id})")
 
-    logger.info("Shift 2 schedule registered")
     logger.info("✅ All reminders scheduled successfully!")
 
 
 # ---------------- BOT SETUP ----------------
 async def setup_bot_commands(app):
     commands = [
-        # BotCommand("start_audit", "Start production audit manually"),
-        # BotCommand("end_audit", "End current audit"),
         BotCommand("hourly_summary_ai", "Hourly AI summary (optional: hour 0-23)"),
         BotCommand("shift_1_summary", "Shift 1 summary from hourly data"),
         BotCommand("shift_2_summary", "Shift 2 summary from hourly data"),
@@ -5652,14 +5592,16 @@ async def setup_bot_commands(app):
 
 
 async def send_daily_plan_if_needed(
-    bot, now: datetime, skip_window_check: bool = False
+    bot, now: datetime, skip_window_check: bool = False, chat_id: int | None = None
 ) -> bool:
     """
     Send daily plan catchup if not yet sent today.
     skip_window_check: when True (line_on, sanitation_end, reboot), post regardless of time.
     Otherwise only post within first 45 min of shift 1.
     """
-    global daily_plan_last_date
+    if chat_id is None:
+        chat_id = default_chat_id()
+    rt_sdp = line_runtime(chat_id)
     today = now.date()
     today_iso = today.isoformat()
 
@@ -5667,7 +5609,7 @@ async def send_daily_plan_if_needed(
     # Do NOT skip based on daily_plan_{today_iso} alone — scheduler may have
     # been suppressed while line was OFF and never written that key (with the
     # new fix), but old stale keys from previous session could still exist.
-    if bot_state_get(f"daily_plan_catchup_{today_iso}"):
+    if bot_state_get(f"daily_plan_catchup_{today_iso}", chat_id):
         logger.info("Daily plan already sent today (catchup check), skipping")
         return False
 
@@ -5686,13 +5628,13 @@ async def send_daily_plan_if_needed(
     )
     try:
         await bot.send_message(
-            chat_id=GROUP_CHAT_ID, text=daily_plan_text, parse_mode="Markdown"
+            chat_id=chat_id, text=daily_plan_text, parse_mode="Markdown"
         )
         # Only mark as sent AFTER successful delivery
-        bot_state_set(f"daily_plan_catchup_{today_iso}", "1")
-        bot_state_set(f"daily_plan_{today_iso}", "1")
-        daily_plan_last_date = today
-        bot_state_set("daily_plan_last_date", today_iso)
+        bot_state_set(f"daily_plan_catchup_{today_iso}", "1", chat_id)
+        bot_state_set(f"daily_plan_{today_iso}", "1", chat_id)
+        rt_sdp.last_plan_date = today
+        bot_state_set("daily_plan_last_date", today_iso, chat_id)
         logger.info("Daily plan reminder sent (catchup)")
         return True
     except Exception as e:
@@ -5701,10 +5643,16 @@ async def send_daily_plan_if_needed(
 
 
 async def send_shift_plan_if_needed(
-    bot, current_shift_num: int, now: datetime, skip_window_check: bool = False
+    bot,
+    current_shift_num: int,
+    now: datetime,
+    skip_window_check: bool = False,
+    chat_id: int | None = None,
 ) -> bool:
     """Send shift plan for current shift if not yet sent (once per shift)."""
-    global shift_plan_sent_today
+    if chat_id is None:
+        chat_id = default_chat_id()
+    rt_ssp = line_runtime(chat_id)
     today = now.date()
     today_iso = today.isoformat()
 
@@ -5719,7 +5667,7 @@ async def send_shift_plan_if_needed(
     # fired_key alone is NOT reliable — scheduler may have been suppressed
     # while line was OFF and never written it (with the new fix), but a
     # stale fired_key from a previous run could still block the catchup.
-    if bot_state_get(catch_key):
+    if bot_state_get(catch_key, chat_id):
         logger.info(f"Shift {current_shift_num} plan already sent, skipping catchup")
         return False
 
@@ -5743,11 +5691,11 @@ async def send_shift_plan_if_needed(
         + "- Expected manpower / constraints"
     )
     try:
-        await bot.send_message(chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown")
+        await bot.send_message(chat_id=chat_id, text=text, parse_mode="Markdown")
         # Only mark as sent AFTER successful delivery
-        bot_state_set(catch_key, "1")
-        bot_state_set(fired_key, "1")
-        shift_plan_sent_today[current_shift_num] = today
+        bot_state_set(catch_key, "1", chat_id)
+        bot_state_set(fired_key, "1", chat_id)
+        rt_ssp.plan_sent_today[current_shift_num] = today
         logger.info(f"Shift {current_shift_num} plan sent (catchup)")
         return True
     except Exception as e:
@@ -5784,7 +5732,11 @@ def get_current_hour_number(current_shift_num: int, now: datetime) -> int:
 
 
 async def send_current_hour_plan(
-    bot, current_shift_num: int, now: datetime, force_if_late: bool = False
+    bot,
+    current_shift_num: int,
+    now: datetime,
+    force_if_late: bool = False,
+    chat_id: int | None = None,
 ) -> bool:
     """
     Send hourly plan for the current hour if not already sent.
@@ -5792,6 +5744,8 @@ async def send_current_hour_plan(
                         (used when line turns ON mid-hour after being OFF).
     Never sends at :55+ (summary window).
     """
+    if chat_id is None:
+        chat_id = default_chat_id()
     current_hour = get_current_hour_number(current_shift_num, now)
     today_iso = now.date().isoformat()
 
@@ -5817,7 +5771,7 @@ async def send_current_hour_plan(
     catch_key = f"hourly_plan_{today_iso}_{current_shift_num}_{current_hour}"
 
     # Only skip if catch_key set — confirmed actual delivery
-    if bot_state_get(catch_key):
+    if bot_state_get(catch_key, chat_id):
         logger.info(
             f"Hourly plan Shift {current_shift_num} Hour {current_hour} already sent, skipping"
         )
@@ -5836,16 +5790,17 @@ async def send_current_hour_plan(
     )
     try:
         sent = await bot.send_message(
-            chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown"
+            chat_id=chat_id, text=text, parse_mode="Markdown"
         )
-        bot_state_set(catch_key, "1")
-        bot_state_set(sched_key, "1")
+        bot_state_set(catch_key, "1", chat_id)
+        bot_state_set(sched_key, "1", chat_id)
         _record_reminder_message(
             {"kind": "hourly_plan", "shift": current_shift_num, "hour": current_hour},
             sent.message_id,
+            chat_id=chat_id,
         )
         prev_shift, prev_hour = _previous_frame(current_shift_num, current_hour)
-        await delete_reminder_frame(bot, prev_shift, prev_hour)
+        await delete_reminder_frame(bot, prev_shift, prev_hour, chat_id)
         logger.info(
             f"Hourly plan sent (catchup{'/late' if force_if_late else ''}): "
             f"Shift {current_shift_num} Hour {current_hour}"
@@ -5857,9 +5812,15 @@ async def send_current_hour_plan(
 
 
 async def handle_partial_hours_on_line_resume(
-    bot, current_shift_num: int, line_off_time: datetime, line_on_time: datetime
+    bot,
+    current_shift_num: int,
+    line_off_time: datetime,
+    line_on_time: datetime,
+    chat_id: int | None = None,
 ):
     """Handle partial hours when line comes back on after being off."""
+    if chat_id is None:
+        chat_id = default_chat_id()
     if not line_off_time:
         return
 
@@ -5894,7 +5855,7 @@ async def handle_partial_hours_on_line_resume(
         # Check if hourly summary was already sent for this hour
         today_iso = line_on_time.date().isoformat()
         key = f"hourly_summary_{today_iso}_{current_shift_num}_{current_hour}"
-        if not bot_state_get(key):
+        if not bot_state_get(key, chat_id):
             header = f"📅 {format_date_time_12h(line_on_time)}\n\n"
             hourly_summary_text = (
                 header
@@ -5909,11 +5870,11 @@ async def handle_partial_hours_on_line_resume(
             )
             try:
                 sent = await bot.send_message(
-                    chat_id=GROUP_CHAT_ID,
+                    chat_id=chat_id,
                     text=hourly_summary_text,
                     parse_mode="Markdown",
                 )
-                bot_state_set(key, "1")
+                bot_state_set(key, "1", chat_id)
                 _record_reminder_message(
                     {
                         "kind": "hourly_summary",
@@ -5921,6 +5882,7 @@ async def handle_partial_hours_on_line_resume(
                         "hour": current_hour,
                     },
                     sent.message_id,
+                    chat_id=chat_id,
                 )
                 logger.info(
                     f"Partial hour summary reminder sent for Shift {current_shift_num}, Hour {current_hour} ({total_production_minutes} min production)"
@@ -5937,7 +5899,7 @@ async def handle_partial_hours_on_line_resume(
         # Check if shift summary was already sent for this shift today
         today_iso = line_on_time.date().isoformat()
         key = f"shift_report_{today_iso}_{current_shift_num}"
-        if not bot_state_get(key):
+        if not bot_state_get(key, chat_id):
             header = f"📅 {format_date_time_12h(line_on_time)}\n\n"
             shift_summary_text = (
                 header
@@ -5949,11 +5911,11 @@ async def handle_partial_hours_on_line_resume(
             )
             try:
                 await bot.send_message(
-                    chat_id=GROUP_CHAT_ID,
+                    chat_id=chat_id,
                     text=shift_summary_text,
                     parse_mode="Markdown",
                 )
-                bot_state_set(key, "1")
+                bot_state_set(key, "1", chat_id)
                 logger.info(
                     f"Shift {current_shift_num} summary reminder sent (near shift end after line resume)"
                 )
@@ -6042,20 +6004,25 @@ def is_in_shift_plan_recovery_window(shift: int, now: datetime) -> bool:
     return 0 <= (minutes - start) <= 45
 
 
-async def catch_up_missed_reminders(app, current_shift_num: int, now: datetime):
+async def catch_up_missed_reminders(
+    app, current_shift_num: int, now: datetime, chat_id: int | None = None
+):
     """
     On bot startup: send Daily Plan and Shift Plan if not posted; then any missed hourly reminders.
     Respects line state — planning reminders suppressed if line is OFF/sanitation.
     """
+    if chat_id is None:
+        chat_id = default_chat_id()
+    rt_cu = line_runtime(chat_id)
     today_iso = now.date().isoformat()
-    line_is_active = line_state == LINE_STATE_RUNNING
-    shift_has_production = shift_had_production.get(
+    line_is_active = rt_cu.line_state == LINE_STATE_RUNNING
+    shift_has_production = rt_cu.shift_had_production.get(
         current_shift_num, False
-    ) or _shift_had_any_production(current_shift_num, today_iso)
+    ) or _shift_had_any_production(current_shift_num, today_iso, chat_id)
 
     logger.info(
-        f"[STARTUP-CATCHUP] Shift {current_shift_num} | "
-        f"line_state={line_state} | shift_has_production={shift_has_production}"
+        f"[STARTUP-CATCHUP] Shift {current_shift_num} chat={chat_id} | "
+        f"line_state={rt_cu.line_state} | shift_has_production={shift_has_production}"
     )
 
     # CASE 1: Line OFF entire shift, no production — suppress everything
@@ -6067,7 +6034,9 @@ async def catch_up_missed_reminders(app, current_shift_num: int, now: datetime):
 
     # 1. Daily plan — only if line active
     if line_is_active:
-        await send_daily_plan_if_needed(app.bot, now, skip_window_check=True)
+        await send_daily_plan_if_needed(
+            app.bot, now, skip_window_check=True, chat_id=chat_id
+        )
         await asyncio.sleep(1)
     else:
         logger.info("[STARTUP-CATCHUP] Daily plan skipped — line OFF (CASE 2)")
@@ -6075,7 +6044,7 @@ async def catch_up_missed_reminders(app, current_shift_num: int, now: datetime):
     # 2. Shift plan — only if line active
     if line_is_active:
         await send_shift_plan_if_needed(
-            app.bot, current_shift_num, now, skip_window_check=True
+            app.bot, current_shift_num, now, skip_window_check=True, chat_id=chat_id
         )
         await asyncio.sleep(1)
     else:
@@ -6085,7 +6054,9 @@ async def catch_up_missed_reminders(app, current_shift_num: int, now: datetime):
 
     # 3. Hourly plan — only if line active
     if line_is_active:
-        await send_current_hour_plan(app.bot, current_shift_num, now)
+        await send_current_hour_plan(
+            app.bot, current_shift_num, now, chat_id=chat_id
+        )
         await asyncio.sleep(1)
     else:
         logger.info(f"[STARTUP-CATCHUP] Hourly plan skipped — line OFF (CASE 2)")
@@ -6098,7 +6069,7 @@ async def catch_up_missed_reminders(app, current_shift_num: int, now: datetime):
             catch_key = (
                 f"hourly_summary_{today_iso}_{current_shift_num}_{current_hour_num}"
             )
-            if not bot_state_get(sched_key) and not bot_state_get(catch_key):
+            if not bot_state_get(sched_key, chat_id) and not bot_state_get(catch_key, chat_id):
                 header = f"📅 {format_date_time_12h(now)}\n\n"
                 text = (
                     header
@@ -6112,10 +6083,10 @@ async def catch_up_missed_reminders(app, current_shift_num: int, now: datetime):
                 )
                 try:
                     sent = await app.bot.send_message(
-                        chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown"
+                        chat_id=chat_id, text=text, parse_mode="Markdown"
                     )
-                    bot_state_set(sched_key, "1")
-                    bot_state_set(catch_key, "1")
+                    bot_state_set(sched_key, "1", chat_id)
+                    bot_state_set(catch_key, "1", chat_id)
                     _record_reminder_message(
                         {
                             "kind": "hourly_summary",
@@ -6123,6 +6094,7 @@ async def catch_up_missed_reminders(app, current_shift_num: int, now: datetime):
                             "hour": current_hour_num,
                         },
                         sent.message_id,
+                        chat_id=chat_id,
                     )
                     logger.info(
                         f"[STARTUP-CATCHUP] Hourly summary sent: "
@@ -6142,7 +6114,7 @@ async def catch_up_missed_reminders(app, current_shift_num: int, now: datetime):
         if shift_has_production:
             fired_key = f"shift_report_fired_{today_iso}_{current_shift_num}"
             recovery_key = f"shift_report_recovery_{today_iso}_{current_shift_num}"
-            if not bot_state_get(fired_key) and not bot_state_get(recovery_key):
+            if not bot_state_get(fired_key, chat_id) and not bot_state_get(recovery_key, chat_id):
                 header = f"📅 {format_date_time_12h(now)}\n\n"
                 text = (
                     header
@@ -6154,10 +6126,10 @@ async def catch_up_missed_reminders(app, current_shift_num: int, now: datetime):
                 )
                 try:
                     await app.bot.send_message(
-                        chat_id=GROUP_CHAT_ID, text=text, parse_mode="Markdown"
+                        chat_id=chat_id, text=text, parse_mode="Markdown"
                     )
-                    bot_state_set(fired_key, "1")
-                    bot_state_set(recovery_key, "1")
+                    bot_state_set(fired_key, "1", chat_id)
+                    bot_state_set(recovery_key, "1", chat_id)
                     logger.info(
                         f"[STARTUP-CATCHUP] Shift {current_shift_num} summary sent"
                     )
@@ -6168,66 +6140,70 @@ async def catch_up_missed_reminders(app, current_shift_num: int, now: datetime):
                 f"[STARTUP-CATCHUP] Shift summary skipped — no production "
                 f"Shift {current_shift_num}"
             )
-            bot_state_set(f"shift_report_fired_{today_iso}_{current_shift_num}", "1")
+            bot_state_set(f"shift_report_fired_{today_iso}_{current_shift_num}", "1", chat_id)
 
 
 async def post_init(app):
-    global current_shift, daily_plan_last_date
-
     load_bot_state_from_db()
     await setup_bot_commands(app)
     await setup_shift_schedules(app)
 
     now = now_ethiopia()
     current_shift_by_clock = get_shift_for_time(now)
-    current_shift = current_shift_by_clock
-    logger.info(
-        f"Bot started: Synced current_shift to {current_shift} (clock time: {now.strftime('%H:%M:%S')})"
-    )
 
-    # On startup: only catchup daily plan + shift plan + hourly plan if missed
+    lines = configured_lines() or ["1ltr"]
+
+    # On startup: only send catchup daily plan + shift plan + hourly plan if missed
     # Do NOT call recover_missed_reminders_on_reconnect here — that causes
     # shift plan to fire as "missed" before the scheduler gets a chance at :02
-    await catch_up_missed_reminders(app, current_shift, now)
+    for line_key in lines:
+        chat_id = chat_id_for_line(line_key)
+        rt_pi = line_runtime_for_line(line_key)
+        rt_pi.current_shift = current_shift_by_clock
+        logger.info(
+            f"Bot started: Synced line {line_key} current_shift to "
+            f"{current_shift_by_clock} (clock time: {now.strftime('%H:%M:%S')})"
+        )
+        await catch_up_missed_reminders(app, current_shift_by_clock, now, chat_id)
+        await asyncio.sleep(1)
 
-    # Start background connection watchdog — recovery only fires after real internet drop
+        startup_msg = (
+            f"🤖 Bot Started Successfully — Line {line_key}\n\n"
+            f"⏰ Current Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
+            f"📅 Current Shift: {current_shift_by_clock}\n"
+            f"🏭 Line State: {rt_pi.line_state}\n"
+            f"✅ Reminders: ACTIVE\n"
+            f"🔌 Connection Watchdog: ACTIVE\n\n"
+            f"All scheduled reminders are configured.\nUse /bot_status to check current state."
+        )
+        try:
+            await app.bot.send_message(chat_id=chat_id, text=startup_msg)
+            logger.info(f"Startup message sent to line {line_key}")
+        except Exception as e:
+            logger.error(f"Failed to send startup message for line {line_key}: {e}")
+
+    # Start background connection watchdog — recovery only fires after real drop
     asyncio.create_task(connection_watchdog(app))
     logger.info("[WATCHDOG] Connection watchdog task created")
-
-    startup_msg = (
-        f"🤖 Bot Started Successfully\n\n"
-        f"⏰ Current Time: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"📅 Current Shift: {current_shift}\n"
-        f"🏭 Line State: {line_state}\n"
-        f"✅ Reminders: ACTIVE\n"
-        f"🔌 Connection Watchdog: ACTIVE\n\n"
-        f"All scheduled reminders are configured.\nUse /bot_status to check current state."
-    )
-    try:
-        await app.bot.send_message(chat_id=GROUP_CHAT_ID, text=startup_msg)
-        logger.info("Startup message sent to group")
-    except Exception as e:
-        logger.error(f"Failed to send startup message: {e}")
 
 
 # ---------------- LINE / SANITATION CONTROL COMMANDS ----------------
 async def line_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global \
-        line_state, \
-        line_off_since, \
-        line_off_next_reminder_allowed, \
-        line_off_one_reminder_fired
+    if not is_allowed_chat(update.effective_chat.id if update.effective_chat else None):
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    rt_off = line_runtime(chat_id)
     now = now_ethiopia()
-    line_state = LINE_STATE_OFF
-    line_off_since = now
+    rt_off.line_state = LINE_STATE_OFF
+    rt_off.off_since = now
     # Allow exactly ONE next scheduled reminder after this OFF event, then suppress.
-    line_off_next_reminder_allowed = True
-    line_off_one_reminder_fired = False
-    bot_state_set("line_state", line_state)
-    bot_state_set("line_off_since", now.isoformat())
+    rt_off.next_reminder_allowed = True
+    rt_off.one_reminder_fired = False
+    bot_state_set("line_state", rt_off.line_state, chat_id)
+    bot_state_set("line_off_since", now.isoformat(), chat_id)
 
     current_shift_num = get_shift_for_time(now)
-    shift_had_production[current_shift_num] = True  # production existed before this OFF
+    rt_off.shift_had_production[current_shift_num] = True  # production existed before this OFF
 
     await update.message.reply_text(
         "⚠️ Line set to OFF.\n"
@@ -6238,63 +6214,66 @@ async def line_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def line_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global line_state, line_off_since, current_shift
-    global line_off_next_reminder_allowed, line_off_one_reminder_fired
+    if not is_allowed_chat(update.effective_chat.id if update.effective_chat else None):
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    rt_on = line_runtime(chat_id)
     now = now_ethiopia()
-    line_state = LINE_STATE_RUNNING
-    line_off_since = None
-    line_off_next_reminder_allowed = True
-    line_off_one_reminder_fired = False
-    bot_state_set("line_state", line_state)
-    bot_state_set("line_off_since", "")
+    rt_on.line_state = LINE_STATE_RUNNING
+    rt_on.off_since = None
+    rt_on.next_reminder_allowed = True
+    rt_on.one_reminder_fired = False
+    bot_state_set("line_state", rt_on.line_state, chat_id)
+    bot_state_set("line_off_since", "", chat_id)
 
     current_shift_by_clock = get_shift_for_time(now)
-    current_shift = current_shift_by_clock
-    shift_had_production[current_shift] = True
+    rt_on.current_shift = current_shift_by_clock
+    rt_on.shift_had_production[current_shift_by_clock] = True
 
     await update.message.reply_text(
         "✅ Line set to ON.\nProcessing reminders and checking for missed items..."
     )
 
-    today_iso = now.date().isoformat()
-
     # 1. Daily plan
-    await send_daily_plan_if_needed(context.bot, now, skip_window_check=True)
+    await send_daily_plan_if_needed(
+        context.bot, now, skip_window_check=True, chat_id=chat_id
+    )
     await asyncio.sleep(1)
 
     # 2. Shift plan
     await send_shift_plan_if_needed(
-        context.bot, current_shift, now, skip_window_check=True
+        context.bot, current_shift_by_clock, now, skip_window_check=True, chat_id=chat_id
     )
     await asyncio.sleep(1)
 
     # 3. Hourly plan — force send even if past :30 window
     #    (operator needs it regardless of what minute line turned ON)
     #    Only skipped if we're in summary window (:55+) — too late for a plan
-    await send_current_hour_plan(context.bot, current_shift, now, force_if_late=True)
+    await send_current_hour_plan(
+        context.bot, current_shift_by_clock, now, force_if_late=True, chat_id=chat_id
+    )
     await asyncio.sleep(1)
 
     # 4. Flush any AI-muted queued reminders
-    await flush_pending_reminders(context.bot, reason="line")
+    await flush_pending_reminders(context.bot, reason="line", chat_id=chat_id)
 
 
 async def sanitation_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global \
-        line_state, \
-        line_off_since, \
-        line_off_next_reminder_allowed, \
-        line_off_one_reminder_fired
+    if not is_allowed_chat(update.effective_chat.id if update.effective_chat else None):
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    rt_san = line_runtime(chat_id)
     now = now_ethiopia()
-    line_state = LINE_STATE_SANITATION
-    line_off_since = now
+    rt_san.line_state = LINE_STATE_SANITATION
+    rt_san.off_since = now
     # Allow exactly ONE next scheduled reminder after sanitation starts, then suppress.
-    line_off_next_reminder_allowed = True
-    line_off_one_reminder_fired = False
-    bot_state_set("line_state", line_state)
-    bot_state_set("line_off_since", now.isoformat())
+    rt_san.next_reminder_allowed = True
+    rt_san.one_reminder_fired = False
+    bot_state_set("line_state", rt_san.line_state, chat_id)
+    bot_state_set("line_off_since", now.isoformat(), chat_id)
 
     current_shift_num = get_shift_for_time(now)
-    shift_had_production[current_shift_num] = (
+    rt_san.shift_had_production[current_shift_num] = (
         True  # production existed before sanitation
     )
 
@@ -6307,43 +6286,49 @@ async def sanitation_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
 
 
 async def sanitation_end_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    global line_state, line_off_since, current_shift
-    global line_off_next_reminder_allowed, line_off_one_reminder_fired
+    if not is_allowed_chat(update.effective_chat.id if update.effective_chat else None):
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    rt_send = line_runtime(chat_id)
     now = now_ethiopia()
-    line_state = LINE_STATE_RUNNING
-    line_off_since = None
-    line_off_next_reminder_allowed = True
-    line_off_one_reminder_fired = False
-    bot_state_set("line_state", line_state)
-    bot_state_set("line_off_since", "")
+    rt_send.line_state = LINE_STATE_RUNNING
+    rt_send.off_since = None
+    rt_send.next_reminder_allowed = True
+    rt_send.one_reminder_fired = False
+    bot_state_set("line_state", rt_send.line_state, chat_id)
+    bot_state_set("line_off_since", "", chat_id)
 
     current_shift_by_clock = get_shift_for_time(now)
-    current_shift = current_shift_by_clock
-    shift_had_production[current_shift] = True
+    rt_send.current_shift = current_shift_by_clock
+    rt_send.shift_had_production[current_shift_by_clock] = True
 
     await update.message.reply_text(
         "✅ Sanitation finished.\nProcessing reminders and checking for missed items..."
     )
 
     # 1. Daily plan
-    await send_daily_plan_if_needed(context.bot, now, skip_window_check=True)
+    await send_daily_plan_if_needed(
+        context.bot, now, skip_window_check=True, chat_id=chat_id
+    )
     await asyncio.sleep(1)
 
     # 2. Shift plan
     await send_shift_plan_if_needed(
-        context.bot, current_shift, now, skip_window_check=True
+        context.bot, current_shift_by_clock, now, skip_window_check=True, chat_id=chat_id
     )
     await asyncio.sleep(1)
 
     # 3. Hourly plan — force send even if past :30 window
-    await send_current_hour_plan(context.bot, current_shift, now, force_if_late=True)
+    await send_current_hour_plan(
+        context.bot, current_shift_by_clock, now, force_if_late=True, chat_id=chat_id
+    )
     await asyncio.sleep(1)
 
     # 4. Flush AI-muted queued reminders
-    await flush_pending_reminders(context.bot, reason="line")
+    await flush_pending_reminders(context.bot, reason="line", chat_id=chat_id)
 
 
-def load_shift_evidence_from_db(target_date=None) -> dict:
+def load_shift_evidence_from_db(target_date=None, chat_id: int | None = None) -> dict:
     """
     Load shift data from DB and reconstruct ai_shift_evidence-compatible text blobs.
     Reconstructs MECHANICAL / ELECTRICAL / UTILITY headers so parse_downtime_categorized works.
@@ -6352,7 +6337,7 @@ def load_shift_evidence_from_db(target_date=None) -> dict:
     """
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection(chat_id)
         cur = conn.cursor()
 
         if target_date is None:
@@ -6516,7 +6501,9 @@ def load_shift_evidence_from_db(target_date=None) -> dict:
             conn.close()
 
 
-def load_shift_evidence_from_hourly_db(shift: int, target_date=None) -> str | None:
+def load_shift_evidence_from_hourly_db(
+    shift: int, target_date=None, chat_id: int | None = None
+) -> str | None:
     """
     Load ALL hourly records for a given shift+date from hourly_production,
     aggregate them into a single shift-level text blob that parse_report(),
@@ -6524,15 +6511,15 @@ def load_shift_evidence_from_hourly_db(shift: int, target_date=None) -> str | No
 
     Returns a reconstructed report string or None if no hourly data found.
     """
-    _ensure_hourly_production_table()
+    _ensure_hourly_production_table(chat_id)
     conn = None
     try:
-        conn = get_db_connection()
+        conn = get_db_connection(chat_id)
         cur = conn.cursor()
 
         if target_date is None:
             # Find the most recent date with hourly data for this shift
-            target_date = get_latest_hourly_date_for_shift(shift)
+            target_date = get_latest_hourly_date_for_shift(shift, chat_id)
             if not target_date:
                 cur.close()
                 conn.close()
@@ -6677,13 +6664,13 @@ def load_shift_evidence_from_hourly_db(shift: int, target_date=None) -> str | No
             conn.close()
 
 
-def load_all_shifts_from_hourly_db(target_date=None) -> dict:
+def load_all_shifts_from_hourly_db(target_date=None, chat_id: int | None = None) -> dict:
     """
     Load hourly data for ALL shifts on a date, aggregate each shift,
     return {1: [text], 2: [text], "_resolved_date": date}
     compatible with ai_shift_evidence format.
     """
-    _ensure_hourly_production_table()
+    _ensure_hourly_production_table(chat_id)
 
     if target_date is None:
         target_date = now_ethiopia().date()
@@ -6702,7 +6689,7 @@ def load_all_shifts_from_hourly_db(target_date=None) -> dict:
 
     result = {}
     for shift in (1, 2):
-        text = load_shift_evidence_from_hourly_db(shift, target_date)
+        text = load_shift_evidence_from_hourly_db(shift, target_date, chat_id)
         if text:
             result[shift] = [text]
 
@@ -6719,6 +6706,8 @@ async def all_shift_summary_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     - /all_shift_summary 24/02/26  → specific date from DB
     Falls back to in-memory if DB has no data.
     """
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    rt_asc = line_runtime(chat_id)
     specific_date_requested = bool(context.args)
     target_date = None
 
@@ -6742,7 +6731,7 @@ async def all_shift_summary_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         target_date = parsed
 
     # ── Load from DB ─────────────────────────────────────────────────────────
-    db_evidence = load_shift_evidence_from_db(target_date)
+    db_evidence = load_shift_evidence_from_db(target_date, chat_id)
 
     # Extract resolved date without mutating the dict
     resolved_date = db_evidence.get("_resolved_date", target_date)
@@ -6761,16 +6750,16 @@ async def all_shift_summary_cmd(update: Update, context: ContextTypes.DEFAULT_TY
             f"⏳ Generating summary from database for "
             f"{date_label} ({len(db_shifts)} shifts found)..."
         )
-        # Temporarily swap DB data into ai_shift_evidence so existing AI function works unchanged
-        original_evidence = {k: list(v) for k, v in ai_shift_evidence.items()}
+        # Temporarily swap DB evidence into rt.evidence so existing AI function works unchanged
+        original_evidence = {k: list(v) for k, v in rt_asc.evidence.items()}
         for shift in (1, 2):
-            ai_shift_evidence[shift] = db_evidence.get(shift, [])
+            rt_asc.evidence[shift] = db_evidence.get(shift, [])
         try:
-            await generate_multi_shift_summary_and_post(context, db_shifts)
+            await generate_multi_shift_summary_and_post(context, db_shifts, chat_id)
         finally:
             # Always restore original memory even if AI call fails
             for shift in (1, 2):
-                ai_shift_evidence[shift] = original_evidence[shift]
+                rt_asc.evidence[shift] = original_evidence[shift]
 
     elif specific_date_requested:
         await update.message.reply_text(
@@ -6781,7 +6770,7 @@ async def all_shift_summary_cmd(update: Update, context: ContextTypes.DEFAULT_TY
 
     else:
         # No date given, DB empty → fall back to in-memory (original behaviour)
-        included_shifts = [s for s in (1, 2) if ai_shift_evidence.get(s)]
+        included_shifts = [s for s in (1, 2) if rt_asc.evidence.get(s)]
         if len(included_shifts) < 2:
             await update.message.reply_text(
                 "At least two shift summaries are required.\n"
@@ -6791,7 +6780,7 @@ async def all_shift_summary_cmd(update: Update, context: ContextTypes.DEFAULT_TY
         await update.message.reply_text(
             f"⏳ Generating summary from memory ({len(included_shifts)} shifts)..."
         )
-        await generate_multi_shift_summary_and_post(context, included_shifts)
+        await generate_multi_shift_summary_and_post(context, included_shifts, chat_id)
 
 
 def _parse_hour_arg(args: list) -> tuple[int | None, str]:
@@ -6810,7 +6799,9 @@ def _parse_hour_arg(args: list) -> tuple[int | None, str]:
     return None, " ".join(args).strip()
 
 
-def _hour_had_production_or_partial(shift: int, hour: int, date_iso: str) -> bool:
+def _hour_had_production_or_partial(
+    shift: int, hour: int, date_iso: str, chat_id: int | None = None
+) -> bool:
     """
     Check if there was production for a specific hour, even if line went off during that hour.
     Returns True if there was any production for that hour.
@@ -6819,7 +6810,7 @@ def _hour_had_production_or_partial(shift: int, hour: int, date_iso: str) -> boo
     conn = None
     cur = None
     try:
-        conn = get_clean_db_connection()
+        conn = get_clean_db_connection(chat_id)
         cur = conn.cursor()
 
         # First try to check hourly production table if it exists
@@ -6838,7 +6829,7 @@ def _hour_had_production_or_partial(shift: int, hour: int, date_iso: str) -> boo
         # Fallback: Check if there's any production for the entire shift
         # If shift had production, assume this hour might have contributed
         cur.execute(
-            "SELECT actual_output_pack FROM production WHERE date = %s AND shift = %s",
+            "SELECT actual_output_pack FROM production WHERE date = %s AND shift::text = %s::text",
             (date_iso, shift),
         )
         result = cur.fetchone()
@@ -6858,7 +6849,9 @@ def _hour_had_production_or_partial(shift: int, hour: int, date_iso: str) -> boo
             conn.close()
 
 
-def _hour_had_production(shift: int, hour: int, date_iso: str) -> bool:
+def _hour_had_production(
+    shift: int, hour: int, date_iso: str, chat_id: int | None = None
+) -> bool:
     """
     Check if there was any production for a specific hour.
     Returns True if there was production data for that hour.
@@ -6866,7 +6859,7 @@ def _hour_had_production(shift: int, hour: int, date_iso: str) -> bool:
     conn = None
     cur = None
     try:
-        conn = get_clean_db_connection()
+        conn = get_clean_db_connection(chat_id)
         cur = conn.cursor()
 
         # First try to check hourly production table if it exists
@@ -6884,7 +6877,7 @@ def _hour_had_production(shift: int, hour: int, date_iso: str) -> bool:
 
         # Fallback: Check if there's any production for the shift and assume partial hour production
         cur.execute(
-            "SELECT actual_output_pack FROM production WHERE date = %s AND shift = %s",
+            "SELECT actual_output_pack FROM production WHERE date = %s AND shift::text = %s::text",
             (date_iso, shift),
         )
         result = cur.fetchone()
@@ -6903,18 +6896,20 @@ def _hour_had_production(shift: int, hour: int, date_iso: str) -> bool:
             conn.close()
 
 
-def _shift_had_any_production(shift: int, date_iso: str) -> bool:
+def _shift_had_any_production(
+    shift: int, date_iso: str, chat_id: int | None = None
+) -> bool:
     """
     Check if a shift had ANY production (even partial).
     Returns True if there was any production for the shift.
     """
     try:
-        conn = get_db_connection()
+        conn = get_db_connection(chat_id)
         cur = conn.cursor()
 
         # Check main production table for any actual output
         cur.execute(
-            "SELECT actual_output_pack FROM production WHERE date = %s AND shift = %s",
+            "SELECT actual_output_pack FROM production WHERE date = %s AND shift::text = %s::text",
             (date_iso, shift),
         )
         result = cur.fetchone()
@@ -6950,13 +6945,13 @@ def _shift_had_any_production(shift: int, date_iso: str) -> bool:
         return True
 
 
-async def _hourly_reminder_block_timeout(bot, delay: int = 900):
-    """Auto-release ai_reminder_block after delay seconds if user never completes hourly input."""
+async def _hourly_reminder_block_timeout(bot, delay: int = 900, chat_id: int | None = None):
+    """Auto-release ai_block after delay seconds if user never completes hourly input."""
     await asyncio.sleep(delay)
-    global ai_reminder_block
-    if ai_reminder_block:
-        ai_reminder_block = False
-        await flush_pending_reminders(bot, reason="ai")
+    rt_to = line_runtime(chat_id)
+    if rt_to.ai_block:
+        rt_to.ai_block = False
+        await flush_pending_reminders(bot, reason="ai", chat_id=chat_id)
         logger.info("⏰ Hourly reminder block auto-released after 15min timeout")
 
 
@@ -6965,22 +6960,24 @@ async def hourly_summary_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     Two ways to use:
     1) Two-step: Send /hourly_summary_ai. Bot asks for the report. Send the report in your next message.
     2) One message: /hourly_summary_ai Date 18/02/26 Shift 2nd ... (full report text)
-    No need to start AI audit – this command works on its own.
+    No need to start a separate AI audit — this command works on its own.
     """
+    if not is_allowed_chat(update.effective_chat.id if update.effective_chat else None):
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else None
     report_text = " ".join(context.args).strip() if context.args else ""
 
     if not report_text:
         # User sent just /hourly_summary_ai → wait for next message
-        context.user_data["hourly_summary_pending"] = True
-        global ai_reminder_block
-        ai_reminder_block = True
+        line_runtime(chat_id).hourly_summary_pending = True
+        line_runtime(chat_id).ai_block = True
         await update.message.reply_text(
             "✅ Please send your hourly report in the *next message* (same format as shift report):\n"
             "Date, Shift, Product type, Hour number, Available time, Shift plan, Actual, Downtime, Rejects.",
             parse_mode="Markdown",
         )
         # Auto-release block after 15 minutes as safety timeout
-        asyncio.create_task(_hourly_reminder_block_timeout(context.bot))
+        asyncio.create_task(_hourly_reminder_block_timeout(context.bot, chat_id=chat_id))
         return
 
     # Process the report immediately
@@ -7019,26 +7016,29 @@ async def hourly_summary_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TY
                 hour_number=hour_slot,
                 vos_info=h_vos,
                 shift_override=current_shift_num,
+                chat_id=chat_id,
             )
         except Exception as e:
             logger.warning(f"Hourly DB save skipped in command: {e}")
 
         validation = await validate_and_question_hourly(
-            context, report_text, current_shift_num, hour_slot
+            context, report_text, current_shift_num, hour_slot, chat_id
         )
         await asyncio.sleep(1)
 
         if validation and validation.get("_blocked"):
             session_key = validation["_session_key"]
-            context.user_data["active_validation_session"] = session_key
-            validation_sessions[session_key]["_pending_hour"] = hour_slot
-            validation_sessions[session_key]["_report_text"] = report_text
-            validation_sessions[session_key]["_hour_label"] = hour_label
+            rt_hsa = line_runtime(chat_id)
+            rt_hsa.active_validation_key = session_key
+            rt_va = rt_hsa.validation_sessions
+            rt_va[session_key]["_pending_hour"] = hour_slot
+            rt_va[session_key]["_report_text"] = report_text
+            rt_va[session_key]["_hour_label"] = hour_label
             return
         else:
             ai_summary = await ai_generate_hourly_summary_from_text(report_text)
             await context.bot.send_message(
-                chat_id=GROUP_CHAT_ID,
+                chat_id=chat_id,
                 text=f"📝 HOURLY AI SUMMARY ({hour_label})\n\n{ai_summary}",
             )
             await update.message.reply_text(
@@ -7055,26 +7055,27 @@ async def shift_report_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     Shows both Shift 1 and 2 reports
     Shows 'not provided' for shifts without summaries
     """
-    now = now_ethiopia()
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    rt_shift = line_runtime(chat_id)
 
     shifts_to_show = [1, 2]
-    report_title = "📊 SHIFT REPORTS - ALL SHIFTS\n\n"
+    report_title = "📊 SHIFT SUMMARY — ALL SHIFTS\n\n"
 
     report_text = report_title
 
     for shift in shifts_to_show:
-        if daily_ai_shift_summaries.get(shift):
+        if rt_shift.daily_summaries.get(shift):
             report_text += (
-                f"SHIFT {shift} SUMMARY:\n{daily_ai_shift_summaries[shift]}\n\n"
+                f"SHIFT {shift} SUMMARY:\n{rt_shift.daily_summaries[shift]}\n\n"
             )
         else:
             report_text += (
                 f"SHIFT {shift} SUMMARY:\n⚠️ Shift summary is not provided.\n\n"
             )
 
-    # No parse_mode - AI content contains _*[] that break Markdown
+    # No parse_mode - AI may contain _*[] that break Markdown
     await context.bot.send_message(
-        chat_id=GROUP_CHAT_ID,
+        chat_id=chat_id,
         text=report_text,
     )
 
@@ -7133,6 +7134,10 @@ def get_shift_reminders(shift: int) -> list[tuple[str, str]]:
 
 async def bot_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Check bot status and reminder state"""
+    if not is_allowed_chat(update.effective_chat.id if update.effective_chat else None):
+        return
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    rt_stat = line_runtime(chat_id)
     now_pc = now_ethiopia()
     now_eth = to_ethiopian_clock(now_pc)
     current_shift_by_clock = get_shift_for_time(now_pc)
@@ -7175,11 +7180,11 @@ async def bot_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"⏰ Current Time (Ethiopian clock): {format_date_time_12h(now_eth)}\n"
         f"⏰ PC Time: {format_date_time_12h(now_pc)}\n"
         f"📅 Current Shift (by clock): {current_shift_by_clock}\n"
-        f"🔄 Active Shift (bot state): {current_shift}\n"
-        f"🏭 Line State: {line_state}\n"
-        f"🤖 AI Audit Block: {'Yes' if ai_reminder_block else 'No'}\n"
-        f"📋 Queued Reminders: {len(pending_reminders)}\n"
-        f"✅ Reminders Active: {'Yes' if line_state == LINE_STATE_RUNNING and not ai_reminder_block else 'No — reminders are QUEUED'}\n\n"
+        f"🔄 Active Shift (bot state): {rt_stat.current_shift}\n"
+        f"🏭 Line State: {rt_stat.line_state}\n"
+        f"🤖 AI Audit Block: {'Yes' if rt_stat.ai_block else 'No'}\n"
+        f"📋 Queued Reminders: {len(rt_stat.pending_reminders)}\n"
+        f"✅ Reminders Active: {'Yes' if rt_stat.line_state == LINE_STATE_RUNNING and not rt_stat.ai_block else 'No — reminders are QUEUED'}\n\n"
     )
 
     if upcoming_reminders:
@@ -7191,14 +7196,14 @@ async def bot_status_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
             f"⏰ *Shift {current_shift_by_clock} Reminders:* None scheduled\n"
         )
 
-    if pending_reminders:
+    if rt_stat.pending_reminders:
         status_text += "\n📬 *Pending reminders:*\n"
-        for i, item in enumerate(pending_reminders[:5], 1):  # Show first 5
+        for i, item in enumerate(rt_stat.pending_reminders[:5], 1):  # Show first 5
             mute_type = item.get("mute_type", "unknown")
             shift = item.get("shift", "?")
             status_text += f"  {i}. Shift {shift} ({mute_type})\n"
-        if len(pending_reminders) > 5:
-            status_text += f"  ... and {len(pending_reminders) - 5} more\n"
+        if len(rt_stat.pending_reminders) > 5:
+            status_text += f"  ... and {len(rt_stat.pending_reminders) - 5} more\n"
 
     try:
         await update.message.reply_text(status_text, parse_mode="Markdown")
@@ -7241,7 +7246,13 @@ def main():
     # app.post_init = setup_bot_commands
     app.post_init = post_init
     print("Bot running...")
-    print(f"Line state: {line_state}, AI block: {ai_reminder_block}")
+    print(f"Configured lines: {configured_lines() or ['1ltr']}")
+    for k in LINE_KEYS:
+        if chat_id_for_line(k) is not None and db_name_for_line(k) is None:
+            logger.warning(
+                f"Line '{k}' has GROUP_CHAT_ID_{k} but DB_NAME_{k} is missing; "
+                f"it will silently use the legacy DB_NAME database."
+            )
     print("Reminders are ACTIVE by default. Use /bot_status to check state.")
     app.run_polling()
 
