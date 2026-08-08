@@ -547,3 +547,53 @@ def save_hourly_to_database(
     finally:
         cur.close()
         conn.close()
+
+def _shift_had_any_production(
+    shift: int, date_iso: str, chat_id: int | None = None
+) -> bool:
+    """
+    Check if a shift had ANY production (even partial).
+    Returns True if there was any production for the shift.
+    """
+    try:
+        conn = get_db_connection(chat_id)
+        cur = conn.cursor()
+
+        # Check main production table for any actual output
+        cur.execute(
+            "SELECT actual_output_pack FROM production WHERE date = %s AND shift::text = %s::text",
+            (date_iso, shift),
+        )
+        result = cur.fetchone()
+
+        # If main production record exists with >0 output, return True
+        if result is not None and result[0] > 0:
+            cur.close()
+            conn.close()
+            return True
+
+        # Also try to check hourly production table for more granular data if it exists
+        try:
+            cur.execute(
+                "SELECT COUNT(*) FROM hourly_production WHERE date = %s AND shift = %s AND actual_output_pack > 0",
+                (date_iso, shift),
+            )
+            hourly_count = cur.fetchone()[0]
+            if hourly_count > 0:
+                cur.close()
+                conn.close()
+                return True
+        except Exception:
+            # hourly_production table might not exist, that's fine
+            pass
+
+        cur.close()
+        conn.close()
+
+        return False
+    except Exception as e:
+        logger.error(f"Error checking shift production: {e}")
+        # On error, assume there was production to avoid missing summaries
+        return True
+
+
