@@ -733,29 +733,6 @@ def load_bot_state_from_db(chat_id: int | None = None) -> None:
         logger.warning(f"load_bot_state_from_db: {e}")
 
 
-def parse_vos(text: str):
-    """
-    Extracts VOS line like:
-    vos=line cleaning=40'
-    Returns cleaned string or None.
-    """
-    if not text:
-        return None
-
-    # Case-insensitive match
-    match = re.search(r"vos\s*=\s*(.+)", text, re.IGNORECASE)
-
-    if not match:
-        return None
-
-    vos_line = match.group(1).strip()
-
-    # Remove trailing quote if exists
-    vos_line = vos_line.replace("'", "").strip()
-
-    return vos_line if vos_line else None
-
-
 def save_to_database(
     data, downtime, rejects, vos_info=None, shift_override: int | None = None,
     chat_id: int | None = None,
@@ -1199,78 +1176,6 @@ def parse_report(text: str):
         "available_time": available_time,
         "vos": vos,
     }
-
-
-def parse_downtime(text: str):
-    events = []
-    t = text.lower()
-
-    # Lines that are never downtime — skip them regardless of content
-    SKIP_PREFIXES = (
-        "shift plan",
-        "actual output",
-        "actual =",
-        "actual=",
-        "product type",
-        "shift ",
-        "date ",
-        "preform =",
-        "preform=",
-        "bottle =",
-        "bottle=",
-        "cap =",
-        "cap=",
-        "label =",
-        "label=",
-        "shrink =",
-        "shrink=",
-        "available time =",
-        "available time=",
-        "available =",
-        "available=",
-        "vos =",
-        "vos=",
-        "efficiency =",
-        "efficiency=",
-    )
-
-    lines = t.split("\n")
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
-
-        # Skip known non-downtime field lines
-        if any(line.startswith(prefix) for prefix in SKIP_PREFIXES):
-            continue
-
-        # Skip pure date lines (e.g., 24/02/26 or 24-02-2026)
-        if re.match(r"^\d{1,2}[/-]\d{1,2}[/-]\d{2,4}$", line):
-            continue
-
-        # Skip lines that are ONLY a number (standalone values like "3120")
-        if re.match(r"^\d+(\.\d+)?$", line):
-            continue
-
-        # Only match lines with an explicit time unit (min/minutes/') — never bare numbers
-        # This prevents "preform 121" or "actual 3120" from being treated as downtime
-        duration_patterns = [
-            r"(\d+)\s*(?:min|minutes?|')\s*$",  # ends with min/minutes/'
-            r"(\d+)\s*(?:min|minutes?|')\s",  # min/minutes/' in middle
-        ]
-
-        for pattern in duration_patterns:
-            match = re.search(pattern, line)
-            if match:
-                duration = int(match.group(1))
-                # Extract description by removing the duration part
-                desc = re.sub(r"\d+\s*(?:min|minutes?|')\s*$", "", line).strip()
-                desc = desc.replace("vos", "").replace("=", "").strip()
-                if len(desc) > 3:
-                    events.append({"description": desc, "duration": duration})
-                break
-
-    return events
 
 
 def parse_vos(text: str):
