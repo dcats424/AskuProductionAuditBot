@@ -1,33 +1,65 @@
 import re
 import html
 import logging
-import psycopg2
+import sys
 from datetime import datetime, timedelta, time
-from zoneinfo import ZoneInfo
 
-# NOTE:
-# This project uses the Ethiopian *clock* system (≈ 6-hour offset from international clock),
-# not just a timezone conversion. Example: 1:20 PM international ≈ 7:20 Ethiopian clock.
-# We still keep TZ_ETHIOPIA for future use, but shift logic is based on the Ethiopian clock offset.
-TZ_ETHIOPIA = ZoneInfo("Africa/Addis_Ababa")
-
-# Ethiopian clock offset: EthiopianClock = InternationalClock - 6 hours
-ETHIOPIAN_CLOCK_OFFSET = timedelta(hours=-6)
-
-
-def to_ethiopian_clock(dt: datetime) -> datetime:
-    """Convert international (PC) clock datetime to Ethiopian clock datetime (subtract 6 hours)."""
-    return dt + ETHIOPIAN_CLOCK_OFFSET
-
-
-def ethiopian_clock_time_to_pc_time(t: time) -> time:
-    """Convert an Ethiopian clock 'time' to the PC/international clock 'time' (add 6 hours, wrap 24h)."""
-    total = (t.hour * 60 + t.minute + 6 * 60) % (24 * 60)
-    return time(total // 60, total % 60)
-
+from config import (
+    AI_MAX_RETRIES,
+    AI_MAX_TOKENS,
+    AI_MODEL,
+    AI_TIMEOUT_SECONDS,
+    BOT_STATUS_AUTODELETE_SECONDS,
+    BOT_STATUS_LOOKAHEAD_MINUTES,
+    BOT_STATUS_MSG_KEY,
+    BOT_TOKEN,
+    GROQ_API_KEY,
+    HOURLY_PLAN_FIRST_HOUR_START_MINUTE,
+    HOURLY_PLAN_WINDOW_END_MINUTE,
+    HOURLY_PLAN_WINDOW_START_MINUTE,
+    HOURLY_PROMPT_MSG_KEY,
+    HOURLY_SUMMARY_LAST_HOUR_START,
+    HOURLY_SUMMARY_WINDOW_START,
+    HOURLY_TWOSTEP_CMD_MSG_KEY,
+    LINE_KEYS,
+    LINE_STATE_OFF,
+    LINE_STATE_RUNNING,
+    LINE_STATE_SANITATION,
+    REMINDER_FIRST_HOUR_PLAN_MINUTE,
+    REMINDER_HANDOFF_MINUTE,
+    REMINDER_LAST_HOUR_SUMMARY_MINUTE,
+    REMINDER_PLAN_MINUTE,
+    REMINDER_SUMMARY_MINUTE,
+    TZ_ETHIOPIA,
+    chat_id_for_line,
+    configured_lines,
+    db_name_for_line,
+    default_chat_id,
+    ethiopian_clock_time_to_pc_time,
+    format_date_time_12h,
+    format_hour_range_12h,
+    get_default_production_hours,
+    get_shift_duration_minutes,
+    get_shift_for_time,
+    is_allowed_chat,
+    line_key_for_chat,
+    now_ethiopia,
+    to_ethiopian_clock,
+)
+from db import (
+    _ensure_hourly_production_table,
+    bot_state_get,
+    bot_state_set,
+    db_config_for_chat,
+    get_clean_db_connection,
+    get_db_connection,
+    parse_vos_minutes,
+    save_hourly_to_database,
+    save_to_database,
+)
+from state import line_runtime, line_runtime_for_line, load_bot_state_from_db
 
 from telegram import Update, BotCommand
-from dotenv import load_dotenv
 import os
 import sys
 
@@ -42,70 +74,7 @@ from telegram.ext import (
 from groq import Groq
 import asyncio
 
-# ---------------- CONFIG ----------------
-
-# Load the .env file first
-load_dotenv()
-
-# Then access the variables
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-
-# Per-line configuration: one bot serving one group per production line,
-# each group writing to its own database. Keys follow the .env style:
-#   GROUP_CHAT_ID_1ltr, GROUP_CHAT_ID_2ltr, GROUP_CHAT_ID_0.6ltr, GROUP_CHAT_ID_0.3ltr
-#   DB_NAME_1ltr, DB_NAME_2ltr, DB_NAME_0.6ltr, DB_NAME_0.3ltr
-LINE_KEYS = ["1ltr", "2ltr", "0.6ltr", "0.3ltr"]
-
-
-def line_key_for_chat(chat_id: int) -> str | None:
-    for key in LINE_KEYS:
-        env_id = os.getenv(f"GROUP_CHAT_ID_{key}")
-        if env_id and str(chat_id) == env_id.strip():
-            return key
-    return None
-
-
-def is_allowed_chat(chat_id: int | None) -> bool:
-    """True only for chats mapped to a configured production line (allowlist)."""
-    return chat_id is not None and line_key_for_chat(chat_id) is not None
-
-
-def chat_id_for_line(line_key: str) -> int | None:
-    env_id = os.getenv(f"GROUP_CHAT_ID_{line_key}")
-    return int(env_id) if env_id else None
-
-
-def db_name_for_line(line_key: str) -> str | None:
-    return os.getenv(f"DB_NAME_{line_key}")
-
-
-def configured_lines() -> list[str]:
-    return [k for k in LINE_KEYS if chat_id_for_line(k) is not None and db_name_for_line(k)]
-
-
-def default_chat_id() -> int | None:
-    lines = configured_lines()
-    return chat_id_for_line(lines[0]) if lines else None
-
-
-# Base DB credentials are shared across all line databases; only the database name differs.
-BASE_DB_CONFIG = {
-    "host": os.getenv("DB_HOST"),
-    "user": os.getenv("DB_USER"),
-    "password": os.getenv("DB_PASSWORD"),
-    "port": int(os.getenv("DB_PORT", 5432)),
-}
-
-# ---------------- AI CONFIG ----------------
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-AI_MODEL = os.getenv("AI_MODEL", "openai/gpt-oss-120b")
-
 ai_client = Groq(api_key=GROQ_API_KEY)
-
-# ── AI call resilience: timeout + retries ────────────────────────────────────
-AI_TIMEOUT_SECONDS = 60
-AI_MAX_RETRIES = 2
-AI_MAX_TOKENS = 1500
 
 
 async def _call_ai(messages, temperature: float = 0.2, max_tokens: int = AI_MAX_TOKENS) -> str:
@@ -270,89 +239,8 @@ SHIFT_SCHEDULE = {
     1: {"plan_time": time(1, 5), "report_time": time(12, 55)},  # Ethiopian clock
     2: {"plan_time": time(13, 5), "report_time": time(0, 55)},  # Ethiopian clock
 }
-# ---------------- PER-LINE RUNTIME ----------------
-# All in-memory shift/reminder/validation state is per production line,
-# keyed by the Telegram group chat_id of each line. A single bot process
-# serves all 4 line groups, so NO line may share state with another.
-
-
-class LineRuntime:
-    """Mutable per-line runtime state (evidence, shift counters, reminders...)."""
-
-    __slots__ = (
-        "evidence",
-        "daily_summaries",
-        "current_shift",
-        "shift_closed",
-        "pending_reminders",
-        "plan_sent_today",
-        "last_plan_date",
-        "ai_block",
-        "line_state",
-        "off_since",
-        "active_validation_key",
-        "validation_sessions",
-        "hourly_summary_pending",
-        "shift_summary_pending",
-        "next_reminder_allowed",
-        "one_reminder_fired",
-        "shift_had_production",
-    )
-
-    def __init__(self):
-        self.evidence = {1: [], 2: []}
-        self.daily_summaries = {1: None, 2: None}
-        self.current_shift = 1
-        self.shift_closed = {1: False, 2: False}
-        self.pending_reminders = []
-        self.plan_sent_today = {1: None, 2: None}
-        self.last_plan_date = None
-        self.ai_block = False
-        self.line_state = LINE_STATE_RUNNING
-        self.off_since = None
-        self.active_validation_key = None
-        self.validation_sessions = {}
-        self.hourly_summary_pending = False
-        self.shift_summary_pending = None
-        self.next_reminder_allowed = True
-        self.one_reminder_fired = False
-        self.shift_had_production = {1: False, 2: False}
-
-
-_line_runtimes: dict[str, LineRuntime] = {}
-
-
-def line_runtime(chat_id: int | None = None) -> LineRuntime:
-    """Return the LineRuntime for a chat's production line.
-    Falls back to the first configured line (or a fresh default) when
-    the chat is unknown — keeps single-line deployments working."""
-    key = line_key_for_chat(chat_id) if chat_id is not None else None
-    if key is None:
-        lines = configured_lines()
-        key = lines[0] if lines else "1ltr"
-    rt = _line_runtimes.get(key)
-    if rt is None:
-        rt = LineRuntime()
-        _line_runtimes[key] = rt
-    return rt
-
-
-def line_runtime_for_line(line_key: str) -> LineRuntime:
-    key = line_key if line_key in LINE_KEYS else "1ltr"
-    rt = _line_runtimes.get(key)
-    if rt is None:
-        rt = LineRuntime()
-        _line_runtimes[key] = rt
-    return rt
-
-
 # ---------------- SHIFT / REMINDER STATE ----------------
 # Legacy module-level singletons are gone — use line_runtime() instead.
-
-# Line / sanitation / AI reminder gating
-LINE_STATE_RUNNING = "running"
-LINE_STATE_OFF = "line_off"
-LINE_STATE_SANITATION = "sanitation"
 
 # ---------------- PRODUCTION VALIDATION STATE ----------------
 # Per-line validation is stored in LineRuntime.validation_sessions.
@@ -371,44 +259,6 @@ VALIDATION_STATE_PENDING = "pending"  # Questions asked, waiting for answer
 VALIDATION_STATE_APPROVED = "approved"  # Operator's answer was convincing
 VALIDATION_STATE_REJECTED = "rejected"  # Operator failed to justify — unaccounted loss
 VALIDATION_STATE_FOLLOWUP = "followup"  # AI asking follow-up questions
-
-
-def format_date_time_12h(dt: datetime) -> str:
-    """Format as dd/mm/yyyy, h:mm AM/PM (12-hour). Converts to Ethiopia if timezone-aware."""
-    if dt.tzinfo:
-        dt = dt.astimezone(TZ_ETHIOPIA)
-    date_str = dt.strftime("%d/%m/%Y")
-    hour_12 = dt.hour % 12 or 12
-    am_pm = "AM" if dt.hour < 12 else "PM"
-    time_str = f"{hour_12}:{dt.minute:02d} {am_pm}"
-    return f"{date_str}, {time_str}"
-
-
-def format_hour_range_12h(start_hour: int) -> str:
-    """Format hour range as 12-hour AM/PM (e.g., '12:00 AM–1:00 AM')."""
-    end_hour = (start_hour + 1) % 24
-    start_12 = start_hour % 12 or 12
-    start_am_pm = "AM" if start_hour < 12 else "PM"
-    end_12 = end_hour % 12 or 12
-    end_am_pm = "AM" if end_hour < 12 else "PM"
-    return f"{start_12}:00 {start_am_pm}–{end_12}:00 {end_am_pm}"
-
-
-def get_shift_duration_minutes(shift: int) -> int:
-    """Get default shift duration in minutes based on shift number."""
-    return 11 * 60  # 11 hours production per shift (1h rest)
-
-
-def get_default_production_hours(report_type: str, shift: int = None) -> float:
-    """Get default production hours based on report type."""
-    if report_type == "hourly":
-        return 1.0  # 1 hour for hourly summaries
-    elif report_type == "multi_shift":
-        return 22.0  # 22 hours total for multi-shift (2 hours for PM)
-    elif report_type == "shift" and shift:
-        return 11.0  # 11 hours per shift
-    else:
-        return 1.0  # Default to 1 hour
 
 
 async def split_and_send_long_message(bot, chat_id: int, text: str, parse_mode: str | None = None) -> None:
@@ -472,129 +322,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ---------------- DATABASE ----------------
-def db_config_for_chat(chat_id: int | None = None) -> dict:
-    """Return DB config targeting the database for the given chat's production line.
-    Raises ValueError when no line database can be resolved (fail-fast)."""
-    if chat_id is None:
-        raise ValueError("chat_id is required to resolve a production line database")
-    line = line_key_for_chat(chat_id)
-    if not line:
-        raise ValueError(f"chat {chat_id} is not mapped to any configured production line")
-    name = db_name_for_line(line)
-    if not name:
-        raise ValueError(f"line '{line}' has no DB_NAME_{line} configured")
-    cfg = dict(BASE_DB_CONFIG)
-    cfg["database"] = name
-    return cfg
-
-
-def get_db_connection(chat_id: int | None = None):
-    """Get a fresh database connection for the given chat's production line."""
-    return psycopg2.connect(**db_config_for_chat(chat_id))
-
-
-def get_clean_db_connection(chat_id: int | None = None):
-    """Get a clean database connection, ensuring no aborted transactions"""
-    conn = psycopg2.connect(**db_config_for_chat(chat_id))
-    try:
-        # Test if connection is clean by running a simple query
-        cur = conn.cursor()
-        cur.execute("SELECT 1")
-        cur.close()
-        return conn
-    except Exception:
-        # If connection is in aborted state, close and create new one
-        try:
-            conn.close()
-        except Exception:
-            pass
-        return psycopg2.connect(**db_config_for_chat(chat_id))
-
-
-# Schema checks (CREATE/ALTER) are expensive; run them once per DB per process,
-# not on every read/write. A fresh deploy picks up any new migrations automatically.
-_SCHEMA_CHECKED: set[str] = set()
-
-
-def _schema_done(chat_id: int | None) -> bool:
-    db_name = db_config_for_chat(chat_id).get("database")
-    return db_name in _SCHEMA_CHECKED
-
-
-def _mark_schema_done(chat_id: int | None) -> None:
-    db_name = db_config_for_chat(chat_id).get("database")
-    _SCHEMA_CHECKED.add(db_name)
-
-
-def _ensure_bot_state_table(chat_id: int | None = None):
-    """Create bot_state table if it does not exist (checked once per DB per process)."""
-    if _schema_done(chat_id):
-        return
-    conn = get_db_connection(chat_id)
-    cur = conn.cursor()
-    try:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS bot_state (
-                key TEXT PRIMARY KEY,
-                value TEXT,
-                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
-            )
-        """)
-        conn.commit()
-        _mark_schema_done(chat_id)
-    except Exception as e:
-        conn.rollback()
-        logger.warning(f"Could not ensure bot_state table: {e}")
-    finally:
-        cur.close()
-        conn.close()
-
-
-def bot_state_get(key: str, chat_id: int | None = None) -> str | None:
-    """Get value for a bot_state key. Returns None if not set."""
-    _ensure_bot_state_table(chat_id)
-    conn = get_db_connection(chat_id)
-    cur = conn.cursor()
-    try:
-        cur.execute("SELECT value FROM bot_state WHERE key = %s", (key,))
-        row = cur.fetchone()
-        return row[0] if row else None
-    except Exception as e:
-        logger.warning(f"bot_state_get failed: {e}")
-        return None
-    finally:
-        cur.close()
-        conn.close()
-
-
-def bot_state_set(key: str, value: str, chat_id: int | None = None) -> None:
-    """Set value for a bot_state key."""
-    _ensure_bot_state_table(chat_id)
-    conn = get_db_connection(chat_id)
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            """
-            INSERT INTO bot_state (key, value, updated_at)
-            VALUES (%s, %s, CURRENT_TIMESTAMP)
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
-        """,
-            (key, value),
-        )
-        conn.commit()
-    except Exception as e:
-        conn.rollback()
-        logger.warning(f"bot_state_set failed: {e}")
-    finally:
-        cur.close()
-        conn.close()
-
-
 # ── Chat message auto-cleanup helpers ────────────────────────────────────────
-BOT_STATUS_MSG_KEY = "bot_status_msg_id"
-HOURLY_PROMPT_MSG_KEY = "hourly_prompt_msg_id"
-HOURLY_TWOSTEP_CMD_MSG_KEY = "hourly_two_step_cmd_msg_id"
 PENDING_FAILED_MSGS_KEY = "pending_failed_msgs"
 MAX_PENDING_FAILED_MSGS = 10
 
@@ -711,422 +439,6 @@ def _schedule_bot_status_autodelete(
         },
         name="bot_status_autodelete",
     )
-
-
-def load_bot_state_from_db(chat_id: int | None = None) -> None:
-    """Load daily_plan_last_date, shift_plan_sent_today, line_state from the line's DB."""
-    rt = line_runtime(chat_id)
-    try:
-        v = bot_state_get("daily_plan_last_date", chat_id)
-        if v:
-            rt.last_plan_date = datetime.strptime(v, "%Y-%m-%d").date()
-        for i in (1, 2):
-            v = bot_state_get(f"shift_plan_sent_{i}", chat_id)
-            if v:
-                rt.plan_sent_today[i] = datetime.strptime(v, "%Y-%m-%d").date()
-        v = bot_state_get("line_state", chat_id)
-        if v and v in (LINE_STATE_RUNNING, LINE_STATE_OFF, LINE_STATE_SANITATION):
-            rt.line_state = v
-        # off_since is not loaded (stays None after reboot) so partial-hour logic only uses current session
-        logger.info("Loaded bot state from database")
-    except Exception as e:
-        logger.warning(f"load_bot_state_from_db: {e}")
-
-
-def save_to_database(
-    data, downtime, rejects, vos_info=None, shift_override: int | None = None,
-    chat_id: int | None = None,
-):
-    """Save production data. Uses shift_override if provided (for /shift_summary_N)."""
-    conn = get_db_connection(chat_id)
-    cur = conn.cursor()
-    shift = shift_override if shift_override is not None else data["shift"]
-
-    SHIFT_DEFAULT_MINUTES = {1: 660, 2: 660}
-    available_time = data.get("available_time")
-    if available_time is None:
-        available_time = SHIFT_DEFAULT_MINUTES.get(shift, 420)
-
-    try:
-        cur.execute(
-            """
-            INSERT INTO production
-            (date, shift, product_type, shift_plan_pack, actual_output_pack, vos_info, available_time)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (date, shift) DO UPDATE SET
-                product_type = EXCLUDED.product_type,
-                shift_plan_pack = EXCLUDED.shift_plan_pack,
-                actual_output_pack = EXCLUDED.actual_output_pack,
-                vos_info = EXCLUDED.vos_info,
-                available_time = EXCLUDED.available_time,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING id
-        """,
-            (
-                data["date"],
-                shift,
-                data["product_type"],
-                data["plan"],
-                data["actual"],
-                vos_info,
-                available_time,
-            ),
-        )
-        production_id = cur.fetchone()[0]
-
-        cur.execute(
-            "DELETE FROM downtime_events WHERE production_id = %s", (production_id,)
-        )
-        cur.execute("DELETE FROM rejects WHERE production_id = %s", (production_id,))
-
-        for d in downtime:
-            cur.execute(
-                """
-                INSERT INTO downtime_events
-                (production_id, description, duration_min, category)
-                VALUES (%s, %s, %s, %s)
-            """,
-                (
-                    production_id,
-                    d["description"],
-                    d["duration"],
-                    d.get("category", "MECHANICAL"),
-                ),
-            )
-
-        cur.execute(
-            """
-            INSERT INTO rejects
-            (production_id, preform, bottle, cap, label, shrink)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """,
-            (
-                production_id,
-                rejects["preform"],
-                rejects["bottle"],
-                rejects["cap"],
-                rejects["label"],
-                rejects["shrink"],
-            ),
-        )
-
-        conn.commit()
-        logger.info(
-            f"Saved shift {shift} to DB — available_time={available_time} min "
-            f"({'default' if data.get('available_time') is None else 'provided'})"
-        )
-        return production_id
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        cur.close()
-        conn.close()
-
-
-def _ensure_hourly_production_table(chat_id: int | None = None):
-    """Create hourly_production + related tables if they don't exist.
-    Also migrates old schemas (drops stale NOT NULL columns the code doesn't use).
-    Runs once per DB per process (see _schema_done)."""
-    if _schema_done(chat_id):
-        return
-    conn = get_db_connection(chat_id)
-    cur = conn.cursor()
-    try:
-        # 1. Create tables if brand new
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS hourly_production (
-                id SERIAL PRIMARY KEY,
-                date DATE NOT NULL,
-                shift INTEGER NOT NULL,
-                hour INTEGER NOT NULL,
-                product_type TEXT,
-                plan_pack INTEGER DEFAULT 0,
-                actual_output_pack INTEGER DEFAULT 0,
-                available_time INTEGER DEFAULT 60,
-                vos_info TEXT,
-                created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-                UNIQUE(date, shift, hour)
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS hourly_downtime_events (
-                id SERIAL PRIMARY KEY,
-                hourly_production_id INTEGER REFERENCES hourly_production(id) ON DELETE CASCADE,
-                description TEXT,
-                duration_min INTEGER,
-                category TEXT DEFAULT 'MECHANICAL'
-            )
-        """)
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS hourly_rejects (
-                id SERIAL PRIMARY KEY,
-                hourly_production_id INTEGER REFERENCES hourly_production(id) ON DELETE CASCADE,
-                preform INTEGER DEFAULT 0,
-                bottle INTEGER DEFAULT 0,
-                cap INTEGER DEFAULT 0,
-                label INTEGER DEFAULT 0,
-                shrink REAL DEFAULT 0
-            )
-        """)
-
-        # 2. Schema migration: fix old columns that the code doesn't populate
-        #    If hour_start or hour_end exist with NOT NULL, make them nullable
-        #    so INSERT doesn't fail when we don't provide values.
-        cur.execute("""
-            SELECT column_name, is_nullable
-            FROM information_schema.columns
-            WHERE table_name = 'hourly_production'
-              AND column_name IN ('hour_start', 'hour_end')
-        """)
-        old_columns = cur.fetchall()
-
-        for col_name, is_nullable in old_columns:
-            if is_nullable == "NO":
-                cur.execute(
-                    f"ALTER TABLE hourly_production ALTER COLUMN {col_name} DROP NOT NULL"
-                )
-                logger.info(
-                    f"Schema migration: made hourly_production.{col_name} nullable"
-                )
-
-        # 3. Ensure hour column exists (old schema might use hour_number)
-        cur.execute("""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'hourly_production' AND column_name = 'hour'
-        """)
-        if not cur.fetchone():
-            cur.execute("""
-                ALTER TABLE hourly_production ADD COLUMN hour INTEGER
-            """)
-            logger.info("Schema migration: added hour column to hourly_production")
-
-        # 4. Drop hour_plan column if it exists (replaced by available_time)
-        cur.execute("""
-            SELECT column_name
-            FROM information_schema.columns
-            WHERE table_name = 'hourly_production' AND column_name = 'hour_plan'
-        """)
-        if cur.fetchone():
-            cur.execute("ALTER TABLE hourly_production DROP COLUMN hour_plan")
-            logger.info(
-                "Schema migration: dropped hour_plan column (replaced by available_time)"
-            )
-
-        # 5. Ensure available_time has DEFAULT 60
-        cur.execute("""
-            SELECT column_default
-            FROM information_schema.columns
-            WHERE table_name = 'hourly_production' AND column_name = 'available_time'
-        """)
-        result = cur.fetchone()
-        if result and result[0] != "60":
-            cur.execute(
-                "ALTER TABLE hourly_production ALTER COLUMN available_time SET DEFAULT 60"
-            )
-            logger.info("Schema migration: set available_time DEFAULT 60")
-
-        # 6. Ensure UNIQUE constraint on (date, shift, hour) exists
-        cur.execute("""
-            SELECT constraint_name
-            FROM information_schema.table_constraints
-            WHERE table_name = 'hourly_production'
-              AND constraint_type = 'UNIQUE'
-        """)
-        constraints = [row[0] for row in cur.fetchall()]
-
-        # Check if any unique constraint covers (date, shift, hour)
-        has_correct_unique = False
-        for cname in constraints:
-            cur.execute(
-                """
-                SELECT column_name
-                FROM information_schema.constraint_column_usage
-                WHERE constraint_name = %s
-            """,
-                (cname,),
-            )
-            cols = {row[0] for row in cur.fetchall()}
-            if cols == {"date", "shift", "hour"}:
-                has_correct_unique = True
-                break
-
-        if not has_correct_unique:
-            # Drop old unique constraints that might conflict
-            for cname in constraints:
-                try:
-                    cur.execute(
-                        f"ALTER TABLE hourly_production DROP CONSTRAINT IF EXISTS {cname}"
-                    )
-                    logger.info(f"Schema migration: dropped old constraint {cname}")
-                except Exception:
-                    pass
-
-            try:
-                cur.execute("""
-                    ALTER TABLE hourly_production
-                    ADD CONSTRAINT hourly_production_date_shift_hour_key
-                    UNIQUE (date, shift, hour)
-                """)
-                logger.info("Schema migration: added UNIQUE(date, shift, hour)")
-            except Exception as e:
-                logger.warning(
-                    f"Could not add unique constraint (may already exist): {e}"
-                )
-
-        # 7. Performance indexes for the report/aggregation queries
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_hourly_date
-            ON hourly_production (date)
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_hourly_shift_date
-            ON hourly_production (shift, date DESC)
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_hourly_dt_hpid
-            ON hourly_downtime_events (hourly_production_id)
-        """)
-        cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_hourly_rej_hpid
-            ON hourly_rejects (hourly_production_id)
-        """)
-
-        # 8. Add updated_at column where missing (per-table timestamps convention)
-        for tbl in ("hourly_production", "production"):
-            cur.execute("SELECT to_regclass(%s)", (tbl,))
-            if not cur.fetchone()[0]:
-                continue
-            cur.execute(
-                """
-                SELECT column_name
-                FROM information_schema.columns
-                WHERE table_name = %s AND column_name = 'updated_at'
-                """,
-                (tbl,),
-            )
-            if not cur.fetchone():
-                cur.execute(
-                    f"ALTER TABLE {tbl} ADD COLUMN updated_at "
-                    "TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP"
-                )
-                logger.info(f"Schema migration: added updated_at to {tbl}")
-
-        conn.commit()
-        _mark_schema_done(chat_id)
-        logger.info("Hourly production tables ensured (with schema migration)")
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"_ensure_hourly_production_table failed: {e}", exc_info=True)
-    finally:
-        cur.close()
-        conn.close()
-
-
-def save_hourly_to_database(
-    data: dict,
-    downtime: list,
-    rejects: dict,
-    hour_number: int,
-    vos_info: str = None,
-    shift_override: int = None,
-    chat_id: int | None = None,
-) -> int | None:
-    """
-    Save ONE HOUR of production data to hourly_production table.
-    Same pattern as save_to_database but for hourly granularity.
-    """
-    _ensure_hourly_production_table(chat_id)
-    conn = get_clean_db_connection(chat_id)
-    cur = conn.cursor()
-    shift = shift_override if shift_override is not None else data["shift"]
-    available_time = data.get("available_time") or 60
-    if vos_info:
-        vos_minutes = parse_vos_minutes(vos_info)
-        available_time = available_time - vos_minutes
-        available_time = max(available_time, 0)
-
-    try:
-        cur.execute(
-            """
-            INSERT INTO hourly_production
-            (date, shift, hour, product_type, plan_pack, actual_output_pack,
-             available_time, vos_info)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (date, shift, hour) DO UPDATE SET
-                product_type = EXCLUDED.product_type,
-                plan_pack = EXCLUDED.plan_pack,
-                actual_output_pack = EXCLUDED.actual_output_pack,
-                available_time = EXCLUDED.available_time,
-                vos_info = EXCLUDED.vos_info,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING id
-        """,
-            (
-                data["date"],
-                shift,
-                hour_number,
-                data["product_type"],
-                data["plan"],
-                data["actual"],
-                available_time,
-                vos_info,
-            ),
-        )
-        hourly_id = cur.fetchone()[0]
-
-        cur.execute(
-            "DELETE FROM hourly_downtime_events WHERE hourly_production_id = %s",
-            (hourly_id,),
-        )
-        cur.execute(
-            "DELETE FROM hourly_rejects WHERE hourly_production_id = %s", (hourly_id,)
-        )
-
-        for d in downtime:
-            cur.execute(
-                """
-                INSERT INTO hourly_downtime_events
-                (hourly_production_id, description, duration_min, category)
-                VALUES (%s, %s, %s, %s)
-            """,
-                (
-                    hourly_id,
-                    d["description"],
-                    d["duration"],
-                    d.get("category", "MECHANICAL"),
-                ),
-            )
-
-        cur.execute(
-            """
-            INSERT INTO hourly_rejects
-            (hourly_production_id, preform, bottle, cap, label, shrink)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """,
-            (
-                hourly_id,
-                rejects.get("preform", 0),
-                rejects.get("bottle", 0),
-                rejects.get("cap", 0),
-                rejects.get("label", 0),
-                rejects.get("shrink", 0),
-            ),
-        )
-
-        conn.commit()
-        logger.info(
-            f"Saved hourly data: shift={shift} hour={hour_number} to DB (id={hourly_id})"
-        )
-        return hourly_id
-    except Exception as e:
-        conn.rollback()
-        logger.error(f"save_hourly_to_database failed: {e}")
-        return None
-    finally:
-        cur.close()
-        conn.close()
 
 
 # ---------------- PARSING ----------------
@@ -1385,35 +697,6 @@ def compute_risk_assessment(
         else "LOW"
     )
     return risk_score, risk_level
-
-
-# ---------------- SHIFT CALCULATION (BY CLOCK) ----------------
-def now_ethiopia() -> datetime:
-    """
-    Current time in Ethiopia (Africa/Addis_Ababa) for shift logic and scheduling.
-    Ensures bot_status, reminders, and job queue all use the same clock.
-    """
-    return datetime.now(TZ_ETHIOPIA)
-
-
-def get_shift_for_time(dt: datetime | None = None) -> int:
-    """
-    Map PC/international wall-clock time to shift number.
-
-    Ethiopian shifts (Ethiopian clock):
-    - Shift 1: 1:00 AM – 1:00 PM  (12 hours)
-    - Shift 2: 1:00 PM – 1:00 AM  (12 hours)
-
-    Converted to PC/international clock (add 6 hours):
-    - Shift 1: 07:00 – 19:00
-    - Shift 2: 19:00 – 07:00 (next day)
-    """
-    if dt is None:
-        dt = now_ethiopia()
-    t = dt.time()
-    if time(7, 0) <= t < time(19, 0):
-        return 1
-    return 2
 
 
 async def send_or_queue_reminder(
@@ -4350,32 +3633,6 @@ RULES:
 
 
 # ---------------- HOURLY VALIDATION ----------------
-
-
-def parse_vos_minutes(vos_value) -> int:
-    """
-    Parses VOS field which can be:
-      - int/float  : 20       → 20
-      - numeric str: "20"     → 20
-      - text       : "power off 20 min" → 20
-      - None / 0 / empty      → 0
-    """
-    if vos_value is None:
-        return 0
-
-    if isinstance(vos_value, (int, float)):
-        return int(vos_value)
-
-    try:
-        return int(str(vos_value).strip())
-    except ValueError:
-        pass
-
-    match = re.search(r"\b(\d+)\b", str(vos_value))
-    if match:
-        return int(match.group(1))
-
-    return 0
 
 
 # ---------------- SHIFT VALIDATION ----------------
