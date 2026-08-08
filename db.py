@@ -50,22 +50,24 @@ def get_clean_db_connection(chat_id: int | None = None):
 
 # Schema checks (CREATE/ALTER) are expensive; run them once per DB per process,
 # not on every read/write. A fresh deploy picks up any new migrations automatically.
-_SCHEMA_CHECKED: set[str] = set()
+# Two independent caches: bot_state is a different schema than the production tables,
+# so ensuring one must not suppress the other's migration.
+_SCHEMA_CHECKED: dict[str, set[str]] = {"bot_state": set(), "hourly": set()}
 
 
-def _schema_done(chat_id: int | None) -> bool:
+def _schema_done(kind: str, chat_id: int | None) -> bool:
     db_name = db_config_for_chat(chat_id).get("database")
-    return db_name in _SCHEMA_CHECKED
+    return db_name in _SCHEMA_CHECKED[kind]
 
 
-def _mark_schema_done(chat_id: int | None) -> None:
+def _mark_schema_done(kind: str, chat_id: int | None) -> None:
     db_name = db_config_for_chat(chat_id).get("database")
-    _SCHEMA_CHECKED.add(db_name)
+    _SCHEMA_CHECKED[kind].add(db_name)
 
 
 def _ensure_bot_state_table(chat_id: int | None = None):
     """Create bot_state table if it does not exist (checked once per DB per process)."""
-    if _schema_done(chat_id):
+    if _schema_done("bot_state", chat_id):
         return
     conn = get_db_connection(chat_id)
     cur = conn.cursor()
@@ -78,7 +80,7 @@ def _ensure_bot_state_table(chat_id: int | None = None):
             )
         """)
         conn.commit()
-        _mark_schema_done(chat_id)
+        _mark_schema_done("bot_state", chat_id)
     except Exception as e:
         conn.rollback()
         logger.warning(f"Could not ensure bot_state table: {e}")
@@ -131,7 +133,7 @@ def _ensure_hourly_production_table(chat_id: int | None = None):
     """Create hourly_production + related tables if they don't exist.
     Also migrates old schemas (drops stale NOT NULL columns the code doesn't use).
     Runs once per DB per process (see _schema_done)."""
-    if _schema_done(chat_id):
+    if _schema_done("hourly", chat_id):
         return
     conn = get_db_connection(chat_id)
     cur = conn.cursor()
@@ -149,6 +151,7 @@ def _ensure_hourly_production_table(chat_id: int | None = None):
                 available_time INTEGER DEFAULT 60,
                 vos_info TEXT,
                 created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
                 UNIQUE(date, shift, hour)
             )
         """)
@@ -297,7 +300,7 @@ def _ensure_hourly_production_table(chat_id: int | None = None):
         """)
 
         # 8. Add updated_at column where missing (per-table timestamps convention)
-        for tbl in ("hourly_production", "production"):
+        for tbl in ("hourly_production",):
             cur.execute("SELECT to_regclass(%s)", (tbl,))
             if not cur.fetchone()[0]:
                 continue
@@ -317,7 +320,7 @@ def _ensure_hourly_production_table(chat_id: int | None = None):
                 logger.info(f"Schema migration: added updated_at to {tbl}")
 
         conn.commit()
-        _mark_schema_done(chat_id)
+        _mark_schema_done("hourly", chat_id)
         logger.info("Hourly production tables ensured (with schema migration)")
     except Exception as e:
         conn.rollback()
@@ -353,97 +356,6 @@ def parse_vos_minutes(vos_value) -> int:
     return 0
 
 
-def save_to_database(
-    data, downtime, rejects, vos_info=None, shift_override: int | None = None,
-    chat_id: int | None = None,
-):
-    """Save production data. Uses shift_override if provided (for /shift_summary_N)."""
-    conn = get_db_connection(chat_id)
-    cur = conn.cursor()
-    shift = shift_override if shift_override is not None else data["shift"]
-
-    SHIFT_DEFAULT_MINUTES = {1: 660, 2: 660}
-    available_time = data.get("available_time")
-    if available_time is None:
-        available_time = SHIFT_DEFAULT_MINUTES.get(shift, 420)
-
-    try:
-        cur.execute(
-            """
-            INSERT INTO production
-            (date, shift, product_type, shift_plan_pack, actual_output_pack, vos_info, available_time)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (date, shift) DO UPDATE SET
-                product_type = EXCLUDED.product_type,
-                shift_plan_pack = EXCLUDED.shift_plan_pack,
-                actual_output_pack = EXCLUDED.actual_output_pack,
-                vos_info = EXCLUDED.vos_info,
-                available_time = EXCLUDED.available_time,
-                updated_at = CURRENT_TIMESTAMP
-            RETURNING id
-        """,
-            (
-                data["date"],
-                shift,
-                data["product_type"],
-                data["plan"],
-                data["actual"],
-                vos_info,
-                available_time,
-            ),
-        )
-        production_id = cur.fetchone()[0]
-
-        cur.execute(
-            "DELETE FROM downtime_events WHERE production_id = %s", (production_id,)
-        )
-        cur.execute("DELETE FROM rejects WHERE production_id = %s", (production_id,))
-
-        for d in downtime:
-            cur.execute(
-                """
-                INSERT INTO downtime_events
-                (production_id, description, duration_min, category)
-                VALUES (%s, %s, %s, %s)
-            """,
-                (
-                    production_id,
-                    d["description"],
-                    d["duration"],
-                    d.get("category", "MECHANICAL"),
-                ),
-            )
-
-        cur.execute(
-            """
-            INSERT INTO rejects
-            (production_id, preform, bottle, cap, label, shrink)
-            VALUES (%s, %s, %s, %s, %s, %s)
-        """,
-            (
-                production_id,
-                rejects["preform"],
-                rejects["bottle"],
-                rejects["cap"],
-                rejects["label"],
-                rejects["shrink"],
-            ),
-        )
-
-        conn.commit()
-        logger.info(
-            f"Saved shift {shift} to DB — available_time={available_time} min "
-            f"({'default' if data.get('available_time') is None else 'provided'})"
-        )
-        return production_id
-    except Exception as e:
-        conn.rollback()
-        raise e
-    finally:
-        cur.close()
-        conn.close()
-
-
 def save_hourly_to_database(
     data: dict,
     downtime: list,
@@ -455,7 +367,7 @@ def save_hourly_to_database(
 ) -> int | None:
     """
     Save ONE HOUR of production data to hourly_production table.
-    Same pattern as save_to_database but for hourly granularity.
+    Upserts on (date, shift, hour); returns the row id or None on failure.
     """
     _ensure_hourly_production_table(chat_id)
     conn = get_clean_db_connection(chat_id)
@@ -552,45 +464,20 @@ def _shift_had_any_production(
     shift: int, date_iso: str, chat_id: int | None = None
 ) -> bool:
     """
-    Check if a shift had ANY production (even partial).
+    Check if a shift had ANY production (even partial) in the hourly table.
     Returns True if there was any production for the shift.
     """
     try:
         conn = get_db_connection(chat_id)
         cur = conn.cursor()
-
-        # Check main production table for any actual output
         cur.execute(
-            "SELECT actual_output_pack FROM production WHERE date = %s AND shift::text = %s::text",
+            "SELECT COUNT(*) FROM hourly_production WHERE date = %s AND shift = %s AND actual_output_pack > 0",
             (date_iso, shift),
         )
-        result = cur.fetchone()
-
-        # If main production record exists with >0 output, return True
-        if result is not None and result[0] > 0:
-            cur.close()
-            conn.close()
-            return True
-
-        # Also try to check hourly production table for more granular data if it exists
-        try:
-            cur.execute(
-                "SELECT COUNT(*) FROM hourly_production WHERE date = %s AND shift = %s AND actual_output_pack > 0",
-                (date_iso, shift),
-            )
-            hourly_count = cur.fetchone()[0]
-            if hourly_count > 0:
-                cur.close()
-                conn.close()
-                return True
-        except Exception:
-            # hourly_production table might not exist, that's fine
-            pass
-
+        hourly_count = cur.fetchone()[0]
         cur.close()
         conn.close()
-
-        return False
+        return hourly_count > 0
     except Exception as e:
         logger.error(f"Error checking shift production: {e}")
         # On error, assume there was production to avoid missing summaries

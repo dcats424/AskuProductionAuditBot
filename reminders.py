@@ -14,6 +14,8 @@ from config import (
     LINE_STATE_RUNNING,
     SHIFT_SUMMARY_WINDOW_END,
     SHIFT_SUMMARY_WINDOW_START,
+    chat_id_for_line,
+    configured_lines,
     default_chat_id,
     format_date_time_12h,
     get_shift_for_time,

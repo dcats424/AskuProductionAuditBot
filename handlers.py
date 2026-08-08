@@ -192,6 +192,9 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 hour_slot = get_current_hour_number(current_shift_num, now)
 
             hour_label = f"Shift {current_shift_num}, Hour {hour_slot}"
+            report_date = production_data.get("date")
+            if report_date:
+                hour_label = f"Date {report_date.strftime('%d/%m/%Y')} — {hour_label}"
 
             # Save hourly data to database
             try:
@@ -199,7 +202,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 downtime = flatten_categorized_downtime(categorized_dt)
                 rejects = parse_rejects(text)
                 vos_info = parse_vos(text)
-                save_hourly_to_database(
+                saved_id = save_hourly_to_database(
                     data=production_data,
                     downtime=downtime,
                     rejects=rejects,
@@ -208,11 +211,27 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                     shift_override=current_shift_num,
                     chat_id=chat_id,
                 )
+            except Exception as e:
+                saved_id = None
+                logger.warning(f"Hourly DB save skipped: {e}")
+
+            if saved_id is None:
+                logger.error(
+                    f"Hourly DB save FAILED: shift={current_shift_num}, hour={hour_slot}"
+                )
+                sent = await update.message.reply_text(
+                    "⚠️ Your hourly report was NOT saved to the database (DB error).\n"
+                    "Please try again in a few minutes."
+                )
+                _queue_failed_messages(
+                    chat_id,
+                    getattr(update.message, "message_id", None),
+                    getattr(sent, "message_id", None),
+                )
+            else:
                 logger.info(
                     f"Hourly data saved: shift={current_shift_num}, hour={hour_slot}"
                 )
-            except Exception as e:
-                logger.warning(f"Hourly DB save skipped: {e}")
 
             # Validate production — may BLOCK summary
             validation = await validate_and_question_hourly(
@@ -235,7 +254,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 ai_summary = await ai_generate_hourly_summary_from_text(text)
                 await context.bot.send_message(
                     chat_id=chat_id,
-                    text=f"📝 HOURLY AI SUMMARY ({hour_label})\n\n{ai_summary}",
+                    text=f"📝 HOURLY SUMMARY ({hour_label})\n\n{ai_summary}",
                 )
                 # Flush queued reminders after hourly summary completes
                 rt_hm.ai_block = False
@@ -294,10 +313,7 @@ async def line_off_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rt_off.shift_had_production[current_shift_num] = True  # production existed before this OFF
 
     await update.message.reply_text(
-        "⚠️ Line set to OFF.\n"
-        "✅ The NEXT scheduled reminder will still fire.\n"
-        "After that, all hourly reminders will be suppressed until line is ON.\n"
-        "📊 Shift summary will still be sent at shift end (production occurred)."
+        "🚫 Line is OFF — production has stopped. Send /line_on to resume."
     )
 
 
@@ -318,9 +334,7 @@ async def line_on_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     rt_on.current_shift = current_shift_by_clock
     rt_on.shift_had_production[current_shift_by_clock] = True
 
-    await update.message.reply_text(
-        "✅ Line set to ON.\nProcessing reminders and checking for missed items..."
-    )
+    await update.message.reply_text("✅ Line is ON — production resumed.")
 
     # 1. Daily plan
     await send_daily_plan_if_needed(
@@ -366,10 +380,7 @@ async def sanitation_start_cmd(update: Update, context: ContextTypes.DEFAULT_TYP
     )
 
     await update.message.reply_text(
-        "🧼 Sanitation started.\n"
-        "✅ The NEXT scheduled reminder will still fire.\n"
-        "After that, all hourly reminders will be suppressed until sanitation ends.\n"
-        "📊 Shift summary will still be sent at shift end (production occurred)."
+        "🧼 Sanitation started — production is paused for cleaning. Send /sanitation_end to resume."
     )
 
 
@@ -390,9 +401,7 @@ async def sanitation_end_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE)
     rt_send.current_shift = current_shift_by_clock
     rt_send.shift_had_production[current_shift_by_clock] = True
 
-    await update.message.reply_text(
-        "✅ Sanitation finished.\nProcessing reminders and checking for missed items..."
-    )
+    await update.message.reply_text("✅ Sanitation finished — production resumed.")
 
     # 1. Daily plan
     await send_daily_plan_if_needed(
@@ -490,6 +499,9 @@ async def hourly_summary_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TY
             return
 
         hour_label = f"Shift {current_shift_num}, Hour {hour_slot}"
+        report_date = h_prod_check.get("date")
+        if report_date:
+            hour_label = f"Date {report_date.strftime('%d/%m/%Y')} — {hour_label}"
 
         try:
             h_prod = parse_report(report_text)
@@ -497,7 +509,7 @@ async def hourly_summary_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TY
             h_downtime = flatten_categorized_downtime(h_cat_dt)
             h_rejects = parse_rejects(report_text)
             h_vos = parse_vos(report_text)
-            save_hourly_to_database(
+            saved_id = save_hourly_to_database(
                 h_prod,
                 h_downtime,
                 h_rejects,
@@ -507,7 +519,27 @@ async def hourly_summary_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TY
                 chat_id=chat_id,
             )
         except Exception as e:
+            saved_id = None
             logger.warning(f"Hourly DB save skipped in command: {e}")
+
+        if saved_id is None:
+            logger.error(
+                f"Hourly DB save FAILED in /hourly_summary_ai: "
+                f"shift={current_shift_num}, hour={hour_slot}"
+            )
+            sent = await update.message.reply_text(
+                "⚠️ Your report was NOT saved to the database (DB error).\n"
+                "Please try again in a few minutes."
+            )
+            _queue_failed_messages(
+                chat_id,
+                getattr(update.message, "message_id", None),
+                getattr(sent, "message_id", None),
+            )
+        else:
+            logger.info(
+                f"Hourly data saved (command): shift={current_shift_num}, hour={hour_slot}"
+            )
 
         validation = await validate_and_question_hourly(
             context, report_text, current_shift_num, hour_slot, chat_id
@@ -530,10 +562,10 @@ async def hourly_summary_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TY
             ai_summary = await ai_generate_hourly_summary_from_text(report_text)
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"📝 HOURLY AI SUMMARY ({hour_label})\n\n{ai_summary}",
+                text=f"📝 HOURLY SUMMARY ({hour_label})\n\n{ai_summary}",
             )
             await update.message.reply_text(
-                f"✅ Hourly AI summary for {hour_label} posted to group."
+                f"✅ Hourly summary for {hour_label} posted to group."
             )
             await _cleanup_command_after_success(
                 context.bot, chat_id,

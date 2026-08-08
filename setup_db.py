@@ -21,44 +21,6 @@ DB_PORT = int(os.getenv("DB_PORT", 5432))
 
 LINES = ["1ltr", "2ltr", "0.6ltr", "0.3ltr"]
 
-SHIFT_TABLES = [
-    """
-    CREATE TABLE IF NOT EXISTS production (
-        id SERIAL PRIMARY KEY,
-        date DATE NOT NULL,
-        shift VARCHAR(10) NOT NULL,
-        product_type TEXT,
-        shift_plan_pack INTEGER,
-        actual_output_pack INTEGER,
-        vos_info TEXT,
-        available_time INTEGER,
-        hour INTEGER,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(date, shift)
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS downtime_events (
-        id SERIAL PRIMARY KEY,
-        production_id INTEGER REFERENCES production(id) ON DELETE CASCADE,
-        description TEXT,
-        duration_min INTEGER,
-        category TEXT DEFAULT 'MECHANICAL'
-    )
-    """,
-    """
-    CREATE TABLE IF NOT EXISTS rejects (
-        id SERIAL PRIMARY KEY,
-        production_id INTEGER REFERENCES production(id) ON DELETE CASCADE,
-        preform INTEGER DEFAULT 0,
-        bottle INTEGER DEFAULT 0,
-        cap INTEGER DEFAULT 0,
-        label INTEGER DEFAULT 0,
-        shrink REAL DEFAULT 0
-    )
-    """,
-]
-
 HOURLY_TABLES = [
     """
     CREATE TABLE IF NOT EXISTS hourly_production (
@@ -72,6 +34,7 @@ HOURLY_TABLES = [
         available_time INTEGER DEFAULT 60,
         vos_info TEXT,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(date, shift, hour)
     )
     """,
@@ -94,6 +57,25 @@ HOURLY_TABLES = [
         label INTEGER DEFAULT 0,
         shrink REAL DEFAULT 0
     )
+    """,
+]
+
+HOURLY_INDEXES = [
+    """
+    CREATE INDEX IF NOT EXISTS idx_hourly_date
+    ON hourly_production (date)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hourly_shift_date
+    ON hourly_production (shift, date DESC)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hourly_dt_hpid
+    ON hourly_downtime_events (hourly_production_id)
+    """,
+    """
+    CREATE INDEX IF NOT EXISTS idx_hourly_rej_hpid
+    ON hourly_rejects (hourly_production_id)
     """,
 ]
 
@@ -148,11 +130,11 @@ def create_tables():
         )
         cur = conn.cursor()
         try:
-            for ddl in SHIFT_TABLES + HOURLY_TABLES:
+            for ddl in HOURLY_TABLES + HOURLY_INDEXES:
                 cur.execute(ddl)
             cur.execute(BOT_STATE_TABLE)
             conn.commit()
-            print(f"  [ok]   all 7 tables ready in {name}")
+            print(f"  [ok]   all 4 tables ready in {name}")
         except Exception as e:
             conn.rollback()
             print(f"  [FAIL] {name}: {e}", file=sys.stderr)

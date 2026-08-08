@@ -16,7 +16,6 @@ from db import (
     _ensure_hourly_production_table,
     get_db_connection,
     parse_vos_minutes,
-    save_to_database,
 )
 from kpis import (
     compute_risk_assessment,
@@ -24,20 +23,12 @@ from kpis import (
     get_latest_hourly_date_for_shift,
     get_pcs_per_pack,
     load_all_shifts_from_hourly_db,
-    load_shift_evidence_from_db,
     load_shift_evidence_from_hourly_db,
 )
 from messaging import (
     _cleanup_command_after_success,
     _queue_failed_messages,
     split_and_send_long_message,
-)
-from parsing import (
-    flatten_categorized_downtime,
-    parse_downtime_categorized,
-    parse_rejects,
-    parse_report,
-    parse_vos,
 )
 from state import line_runtime
 
@@ -94,62 +85,21 @@ async def all_shift_summary_from_hourly_cmd(
     shifts_found = [s for s in (1, 2) if hourly_evidence.get(s)]
 
     if not shifts_found:
-        # No hourly data this date — fall back to shift-level production table
-        db_evidence = load_shift_evidence_from_db(target_date, chat_id)
-        db_shifts = [s for s in (1, 2) if db_evidence.get(s)]
-        if not db_shifts:
-            sent = await update.message.reply_text(
-                f"⚠️ No data found for {date_label}.\n"
-                "Submit hourly or shift reports for that date first."
-            )
-            _queue_failed_messages(
-                chat_id,
-                getattr(update.message, "message_id", None),
-                getattr(sent, "message_id", None),
-            )
-            return
-        await update.message.reply_text(
-            f"⏳ No hourly data for {date_label}; using shift-level records "
-            f"({len(db_shifts)} shift(s): {db_shifts})..."
+        sent = await update.message.reply_text(
+            f"⚠️ No data found for {date_label}.\n"
+            "Submit hourly reports for that date first."
         )
-        rt_db = line_runtime(chat_id)
-        original_evidence = {k: list(v) for k, v in rt_db.evidence.items()}
-        for s in (1, 2):
-            rt_db.evidence[s] = db_evidence.get(s, [])
-        try:
-            db_result = await generate_multi_shift_summary_and_post(context, db_shifts, chat_id)
-        finally:
-            for s in (1, 2):
-                rt_db.evidence[s] = original_evidence[s]
-        if db_result is True:
-            await _cleanup_command_after_success(
-                context.bot, chat_id,
-                getattr(update.message, "message_id", None),
-            )
-        else:
-            extra = [db_result] if isinstance(db_result, int) else []
-            _queue_failed_messages(
-                chat_id, getattr(update.message, "message_id", None), *extra
-            )
+        _queue_failed_messages(
+            chat_id,
+            getattr(update.message, "message_id", None),
+            getattr(sent, "message_id", None),
+        )
         return
 
     await update.message.reply_text(
         f"⏳ Generating multi-shift summary from hourly data — "
         f"{date_label} ({len(shifts_found)} shift(s): {shifts_found})..."
     )
-
-    # Also save each shift's aggregated data to production table
-    for s in shifts_found:
-        try:
-            text_blob = hourly_evidence[s][0]
-            prod = parse_report(text_blob)
-            cat_dt = parse_downtime_categorized(text_blob)
-            dt_flat = flatten_categorized_downtime(cat_dt)
-            rej = parse_rejects(text_blob)
-            vos = parse_vos(text_blob)
-            save_to_database(prod, dt_flat, rej, vos_info=vos, shift_override=s, chat_id=chat_id)
-        except Exception as e:
-            logger.warning(f"Failed to save aggregated shift {s}: {e}")
 
     # Swap into rt.evidence temporarily
     rt_swap = line_runtime(chat_id)
@@ -265,7 +215,7 @@ async def generate_shift_summary_from_hourly(
         # Post to group
         await split_and_send_long_message(
             context.bot, chat_id,
-            f"📊 SHIFT {shift} SUMMARY (from hourly data - {date_str})\n\n{ai_text}",
+            f"📊 SHIFT {shift} SUMMARY - Date {date_str}\n\n{ai_text}",
         )
         await _cleanup_command_after_success(
             context.bot, chat_id,
@@ -620,7 +570,7 @@ AUDIT_STATUS: {audit_status}
         f"  • Actual: {total_actual:,} packs\n"
         f"  • Available Time: {available_minutes:,} minutes\n"
         f"  • Efficiency: {performance}%\n"
-        f"  • VOS: {vos_display} (week total)"
+        f"  • VOS: {vos_display} ({period_name} total)"
     )
 
     downtime_hours_display = round(total_downtime / 60, 1)

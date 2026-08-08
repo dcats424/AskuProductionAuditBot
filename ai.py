@@ -2044,7 +2044,7 @@ async def _release_summary_after_validation(
             line_runtime(chat_id).ai_block = False
             await context.bot.send_message(
                 chat_id=chat_id,
-                text=f"📝 HOURLY AI SUMMARY ({hour_label})\n\n{ai_summary}",
+                text=f"📝 HOURLY SUMMARY ({hour_label})\n\n{ai_summary}",
             )
 
             # Post the professional validation recap after the report
