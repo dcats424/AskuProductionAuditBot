@@ -51,21 +51,28 @@ jobs:
           cd /home/time/Documents/production-audit-bot
 
           echo "Pulling latest code..."
-          git fetch origin    
+          # Only tracked files are updated. Untracked/local files (.env, bot.log,
+          # local scripts) are intentionally NEVER deleted.
+          git fetch origin
           git reset --hard origin/main
-          git clean -fdx -e .env
 
           echo "Installing dependencies..."
           pip install -r requirements.txt --break-system-packages
 
           echo "Restarting bot..."
-          pkill -f "python3.*bot.py" || true
+          # Match only the actual bot process, never the shell running this script
+          pkill -f "^python3 bot.py" || true
           sleep 1
           nohup python3 bot.py > bot.log 2>&1 &
 
           echo "Checking bot is running..."
-          sleep 2
-          pgrep -f "python3.*bot.py" && echo "Bot running" || echo "Bot failed to start"
+          sleep 3
+          if pgrep -f "^python3 bot.py" > /dev/null; then
+            echo "Bot running"
+          else
+            echo "Bot failed to start"
+            exit 1
+          fi
 
           echo "=============================="
           echo "Deployment completed successfully"
