@@ -24,6 +24,9 @@ config → db → state → messaging → scheduler → reminders → handlers/a
   uses `parse_downtime_categorized` (2879).
 - Remove unused **APScheduler** from requirements.txt (never imported; the bot
   uses telegram's JobQueue).
+- Remove unused **reportlab** from requirements.txt (never imported — all
+  weekly/monthly reports are generated as Telegram text messages via
+  `split_and_send_long_message` (bot.py:414), NOT PDFs).
 - Delete `ai_test.py` scratch file (confirm with user).
 - Baseline verify + commit.
 
@@ -75,7 +78,11 @@ config → db → state → messaging → scheduler → reminders → handlers/a
   `get_pcs_per_pack`, `aggregate_period_from_db`,
   `calculate_expected_production`, `get_shift_duration_minutes`,
   `get_default_production_hours`.
-- **reports.py**: reportlab PDF generation (weekly/monthly).
+- **reports.py**: weekly/monthly/shift report **TEXT builders** posted as
+  Telegram messages (`generate_shift_summary_from_hourly`,
+  `generate_multi_shift_summary_and_post`, `build_downtime_analysis_block`,
+  `format_downtime_category_block`, `format_vos_duration`,
+  `flatten_categorized_downtime`). **No PDFs — reports are sent in the group.**
 - **main.py**: app build (ApplicationBuilder), error handler, ALL
   CommandHandler registrations, `post_init`, entrypoint.
 - Delete bot.py. Full verify + live run + commit.
