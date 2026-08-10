@@ -33,11 +33,13 @@ from db import bot_state_set, save_hourly_to_database
 from messaging import (
     _cleanup_command_after_success,
     _cleanup_hourly_two_step,
+    _delete_or_queue,
     _purge_failed_messages,
     _queue_failed_messages,
     _schedule_bot_status_autodelete,
     _store_hourly_two_step_ids,
     _try_delete_message,
+    post_hourly_summary,
 )
 from parsing import (
     flatten_categorized_downtime,
@@ -252,9 +254,10 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 return
             else:
                 ai_summary = await ai_generate_hourly_summary_from_text(text)
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=f"📝 HOURLY SUMMARY ({hour_label})\n\n{ai_summary}",
+                await post_hourly_summary(
+                    context.bot,
+                    chat_id,
+                    f"📝 HOURLY SUMMARY ({hour_label})\n\n{ai_summary}",
                 )
                 # Flush queued reminders after hourly summary completes
                 rt_hm.ai_block = False
@@ -262,7 +265,7 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 # Clean up: purge failed attempts, delete prompt + command + pasted report
                 await _purge_failed_messages(context.bot, chat_id)
                 await _cleanup_hourly_two_step(context.bot, chat_id)
-                await _try_delete_message(
+                await _delete_or_queue(
                     context.bot, chat_id,
                     getattr(update.message, "message_id", None),
                 )
@@ -452,6 +455,12 @@ async def hourly_summary_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TY
     if not is_allowed_chat(update.effective_chat.id if update.effective_chat else None):
         return
     chat_id = update.effective_chat.id if update.effective_chat else None
+
+    # Remove leftovers from a previous failed attempt before starting a new one
+    await _purge_failed_messages(context.bot, chat_id)
+    await _cleanup_hourly_two_step(context.bot, chat_id)
+    await asyncio.sleep(1)
+
     report_text = " ".join(context.args).strip() if context.args else ""
 
     if not report_text:
@@ -560,16 +569,18 @@ async def hourly_summary_ai_cmd(update: Update, context: ContextTypes.DEFAULT_TY
             return
         else:
             ai_summary = await ai_generate_hourly_summary_from_text(report_text)
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"📝 HOURLY SUMMARY ({hour_label})\n\n{ai_summary}",
+            await post_hourly_summary(
+                context.bot,
+                chat_id,
+                f"📝 HOURLY SUMMARY ({hour_label})\n\n{ai_summary}",
             )
-            await update.message.reply_text(
+            sent_confirm = await update.message.reply_text(
                 f"✅ Hourly summary for {hour_label} posted to group."
             )
             await _cleanup_command_after_success(
                 context.bot, chat_id,
                 getattr(update.message, "message_id", None),
+                getattr(sent_confirm, "message_id", None),
             )
     except Exception as e:
         logger.error(f"Error generating hourly summary: {e}")

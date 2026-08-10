@@ -96,7 +96,7 @@ async def all_shift_summary_from_hourly_cmd(
         )
         return
 
-    await update.message.reply_text(
+    sent_progress = await update.message.reply_text(
         f"⏳ Generating multi-shift summary from hourly data — "
         f"{date_label} ({len(shifts_found)} shift(s): {shifts_found})..."
     )
@@ -116,11 +116,15 @@ async def all_shift_summary_from_hourly_cmd(
         await _cleanup_command_after_success(
             context.bot, chat_id,
             getattr(update.message, "message_id", None),
+            getattr(sent_progress, "message_id", None),
         )
     else:
         extra = [hourly_result] if isinstance(hourly_result, int) else []
         _queue_failed_messages(
-            chat_id, getattr(update.message, "message_id", None), *extra
+            chat_id,
+            getattr(update.message, "message_id", None),
+            getattr(sent_progress, "message_id", None),
+            *extra,
         )
 
 
@@ -198,7 +202,7 @@ async def generate_shift_summary_from_hourly(
         return
 
     date_str = target_date.strftime("%d/%m/%Y") if target_date else "unknown"
-    await update.message.reply_text(
+    sent_progress = await update.message.reply_text(
         f"⏳ Generating Shift {shift} summary from hourly data for {date_str}..."
     )
 
@@ -220,6 +224,7 @@ async def generate_shift_summary_from_hourly(
         await _cleanup_command_after_success(
             context.bot, chat_id,
             getattr(update.message, "message_id", None),
+            getattr(sent_progress, "message_id", None),
         )
 
         # Restore original evidence
@@ -233,6 +238,7 @@ async def generate_shift_summary_from_hourly(
         _queue_failed_messages(
             chat_id,
             getattr(update.message, "message_id", None),
+            getattr(sent_progress, "message_id", None),
             getattr(sent, "message_id", None),
         )
 

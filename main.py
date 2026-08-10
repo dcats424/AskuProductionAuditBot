@@ -12,6 +12,7 @@ from telegram.ext import (
 )
 
 from config import (
+    BOT_STARTUP_AUTODELETE_SECONDS,
     BOT_STATUS_MSG_KEY,
     BOT_TOKEN,
     LINE_KEYS,
@@ -90,7 +91,10 @@ async def post_init(app):
             if startup_message_id:
                 bot_state_set(BOT_STATUS_MSG_KEY, str(startup_message_id), chat_id)
                 _schedule_bot_status_autodelete(
-                    app.job_queue, startup_message_id, chat_id
+                    app.job_queue,
+                    startup_message_id,
+                    chat_id,
+                    delay_seconds=BOT_STARTUP_AUTODELETE_SECONDS,
                 )
             logger.info(f"Startup message sent to line {line_key}")
         except Exception as e:

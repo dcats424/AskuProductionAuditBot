@@ -97,6 +97,8 @@ LINE_STATE_SANITATION = "sanitation"
 BOT_STATUS_MSG_KEY = "bot_status_msg_id"
 HOURLY_PROMPT_MSG_KEY = "hourly_prompt_msg_id"
 HOURLY_TWOSTEP_CMD_MSG_KEY = "hourly_two_step_cmd_msg_id"
+HOURLY_SUMMARY_MSG_KEY = "hourly_summary_msg_id"
+HOURLY_VALIDATION_RECAP_MSG_KEY = "hourly_validation_recap_msg_id"
 
 # ── Scheduling windows / reminder times (Ethiopian clock, minute of hour) ────
 HOURLY_PLAN_WINDOW_START_MINUTE = 2
@@ -114,7 +116,8 @@ REMINDER_SUMMARY_MINUTE = 55
 REMINDER_LAST_HOUR_SUMMARY_MINUTE = 50
 REMINDER_HANDOFF_MINUTE = 55
 BOT_STATUS_LOOKAHEAD_MINUTES = 5
-BOT_STATUS_AUTODELETE_SECONDS = 120  # /bot_status + startup messages self-delete after 2 minutes
+BOT_STATUS_AUTODELETE_SECONDS = 300  # /bot_status message + command self-delete after 5 minutes
+BOT_STARTUP_AUTODELETE_SECONDS = 120  # bot startup message self-deletes after 2 minutes
 
 
 # ---------------- TIME / SHIFT HELPERS ----------------

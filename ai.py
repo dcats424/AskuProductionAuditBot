@@ -18,7 +18,14 @@ from config import (
 )
 from db import parse_vos_minutes
 from kpis import compute_kpis, compute_risk_assessment, get_pcs_per_pack
-from messaging import _cleanup_hourly_two_step, _purge_failed_messages, _try_delete_message
+from messaging import (
+    _cleanup_hourly_two_step,
+    _delete_or_queue,
+    _purge_failed_messages,
+    _try_delete_message,
+    post_hourly_summary,
+    post_validation_recap,
+)
 from parsing import (
     flatten_categorized_downtime,
     format_downtime_category_block,
@@ -1929,13 +1936,10 @@ STYLE RULES:
     )
 
     try:
-        await context.bot.send_message(
-            chat_id=chat_id,
-            text=(
-                f"⚖️ <b>VALIDATION SUMMARY</b>\n\n"
-                f"{badge}\n\n"
-                f"{html.escape(recap_text)}"
-            ),
+        await post_validation_recap(
+            context.bot,
+            chat_id,
+            f"⚖️ <b>VALIDATION SUMMARY</b>\n\n{badge}\n\n{html.escape(recap_text)}",
             parse_mode="HTML",
         )
     except Exception as e:
@@ -2042,9 +2046,10 @@ async def _release_summary_after_validation(
                     ai_summary += validation_notice
 
             line_runtime(chat_id).ai_block = False
-            await context.bot.send_message(
-                chat_id=chat_id,
-                text=f"📝 HOURLY SUMMARY ({hour_label})\n\n{ai_summary}",
+            await post_hourly_summary(
+                context.bot,
+                chat_id,
+                f"📝 HOURLY SUMMARY ({hour_label})\n\n{ai_summary}",
             )
 
             # Post the professional validation recap after the report
@@ -2056,13 +2061,13 @@ async def _release_summary_after_validation(
             # Clean up: purge failed attempts, delete prompt + command + pasted report
             await _purge_failed_messages(context.bot, chat_id)
             await _cleanup_hourly_two_step(context.bot, chat_id)
-            await _try_delete_message(
+            await _delete_or_queue(
                 context.bot, chat_id, session.get("_report_message_id")
             )
 
             # Delete the Q&A messages (validation question + employee answers)
             for msg_id in session.get("_msg_ids_to_delete", []):
-                await _try_delete_message(context.bot, chat_id, msg_id)
+                await _delete_or_queue(context.bot, chat_id, msg_id)
         except Exception as e:
             logger.error(f"Error generating hourly summary after validation: {e}")
 
